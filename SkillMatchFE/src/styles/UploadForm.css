@@ -1,0 +1,137 @@
+.upload-container {
+  min-height: 100vh;
+  background: linear-gradient(135deg, #051d3b, #1f3c73);
+  color: #ffffff;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 2rem;
+  font-family: 'Inter', sans-serif;
+}
+
+.upload-card {
+  background: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  border-radius: 16px;
+  padding: 2.5rem;
+  max-width: 500px;
+  width: 100%;
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.upload-card:hover {
+  transform: translateY(-10px);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7);
+}
+
+.upload-title {
+  font-size: 2rem;
+  font-weight: 900;
+  text-align: center;
+  margin-bottom: 1rem;
+  color: #eef3fb;
+  letter-spacing: 0.5px;
+}
+
+.upload-card p {
+  color: #ccd6f6;
+  font-size: 1.05rem;
+  margin-bottom: 2rem;
+  text-align: center;
+}
+
+.file-uploads {
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+}
+
+.file-upload-box {
+  background: rgba(255, 255, 255, 0.15);
+  border: 2px dashed #5a72cc;
+  border-radius: 12px;
+  padding: 1.8rem;
+  text-align: center;
+  transition: all 0.3s ease-in-out;
+  cursor: pointer;
+}
+
+.file-upload-box:hover {
+  background: rgba(255, 255, 255, 0.25);
+  border-color: #3555aa;
+}
+
+.file-label {
+  display: block;
+  font-weight: 600;
+  color: #d1d9e6;
+  margin-bottom: 0.75rem;
+  font-size: 1rem;
+}
+
+input[type="file"] {
+  cursor: pointer;
+  color: #aab8d1;
+  font-size: 0.95rem;
+}
+
+.uploaded-file-name {
+  background-color: rgba(255, 255, 255, 0.25);
+  color: #d1d9e6;
+  font-weight: 600;
+  padding: 0.4rem 1rem;
+  border-radius: 8px;
+  margin-top: 0.5rem;
+  display: inline-block;
+  font-size: 0.95rem;
+}
+
+.upload-btn {
+  background: linear-gradient(135deg, #38b6ff, #1f98e6);
+  color: white;
+  font-size: 1.1rem;
+  font-weight: 700;
+  padding: 0.85rem 0;
+  border: none;
+  border-radius: 12px;
+  width: 100%;
+  cursor: pointer;
+  box-shadow: 0 8px 20px rgba(35, 102, 190, 0.6);
+  transition: background 0.25s ease, transform 0.25s ease;
+  margin-top: 1.8rem;
+}
+
+.upload-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #2e93ff, #146ac7);
+  transform: translateY(-3px);
+}
+
+.upload-btn:disabled {
+  background: #5077b7;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.sign-up-bar {
+  font-size: 0.95rem;
+  text-align: right;
+  color: #aab8d1;
+  margin-top: 1rem;
+}
+
+@media (max-width: 480px) {
+  .upload-card {
+    max-width: 90%;
+    padding: 1.5rem;
+  }
+
+  .upload-title {
+    font-size: 1.75rem;
+  }
+
+  .upload-btn {
+    font-size: 1rem;
+    padding: 0.7rem 0;
+  }
+}
+
