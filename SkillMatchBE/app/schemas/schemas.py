@@ -8,6 +8,16 @@ class EvaluationSection(BaseModel):
     JD_MatchScore: str = Field(
         description="A numerical score representing the match between the job description (JD) and the candidate's resume. The score should be out of 10, with 10 indicating a perfect match and 1 indicating very poor match. The score must be based on a detailed evaluation of how well the candidate's skills, experience, and qualifications align with the requirements outlined in the JD. Just providing a number without context is not acceptable. Example of output: '7/10 - Good match with key skills but lacks experience in some required technologies.'"
     )
+
+    Extracted_Resume_Skills: List[str] = Field(
+        default_factory=list,
+        description="List of technical skills explicitly found in resume"
+    )
+
+    Extracted_JD_Skills: List[str] = Field(
+        default_factory=list,
+        description="List of required skills from job description"
+    )
     Score_Explanation_NonTechnical: str = Field(
         description="A short explanation (2-3 lines) for non-technical stakeholders that summarizes why the candidate received the given JD match score. Focus on high-level alignment with the job role, such as years of experience, industry fit, or major skill areas."
     )

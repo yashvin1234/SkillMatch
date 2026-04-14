@@ -78,3 +78,102 @@ def filter_grammar_errors(errors, text):
                 break
 
     return filtered
+
+
+def normalize_text(text):
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def extract_from_client_section(lines):
+    clients = []
+
+    for i in range(len(lines)):
+        line = lines[i].lower()
+
+        # Case 1: exact "Client"
+        if line == "client":
+            j = i + 1
+            while j < len(lines) and lines[j] == "":
+                j += 1
+            if j < len(lines):
+                clients.append(lines[j])
+
+        # Case 2: "Client: XYZ"
+        elif line.startswith("client"):
+            parts = lines[i].split(":", 1)
+            if len(parts) > 1:
+                clients.append(parts[1].strip())
+
+    return clients
+
+
+def extract_using_patterns(text):
+    clients = []
+
+    # Pattern 1: "Client - XYZ", "Client for XYZ"
+    patterns = [
+        r'client\s*[:\-]\s*([A-Z][A-Za-z0-9&,\.\' ]+)',
+        r'worked with\s+([A-Z][A-Za-z0-9&,\.\' ]+)',
+        r'project for\s+([A-Z][A-Za-z0-9&,\.\' ]+)',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        clients.extend(matches)
+
+    return clients
+
+
+def clean_clients(clients, resume_text):
+    final = []
+    resume_lower = resume_text.lower()
+
+    for c in clients:
+        c = normalize_text(c)
+
+        # remove very short / noisy
+        if len(c) < 3:
+            continue
+
+        # must roughly exist in resume
+        if any(word in resume_lower for word in c.lower().split()):
+            final.append(c)
+
+    return list(set(final))
+
+
+def extract_client_names_advanced(resume_text):
+    lines = [line.strip() for line in resume_text.splitlines()]
+
+    # Step 1: structured extraction
+    clients = extract_from_client_section(lines)
+
+    # Step 2: pattern fallback
+    if not clients:
+        clients += extract_using_patterns(resume_text)
+
+
+    # Step 3: cleanup + validation
+    clients = clean_clients(clients, resume_text)
+
+    return clients
+
+
+def compute_match_score(resume_skills, jd_skills):
+    if not jd_skills:
+        return 0, [], []
+
+    matched = resume_skills.intersection(jd_skills)
+    missing = jd_skills - resume_skills
+
+    score = (len(matched) / len(jd_skills)) * 10
+
+    return round(score, 1), list(matched), list(missing)
+
+def format_score(score):
+    if score >= 8:
+        return f"{score}/10 - Strong match"
+    elif score >= 5:
+        return f"{score}/10 - Moderate match"
+    else:
+        return f"{score}/10 - Weak match"

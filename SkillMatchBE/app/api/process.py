@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, Depends
-from app.utils.text_extract import extract_text,filter_spelling_errors,filter_grammar_errors
+from app.utils.text_extract import compute_match_score, extract_client_names_advanced, extract_text,filter_spelling_errors,filter_grammar_errors,format_score
 from app.config import memory_store
 from app.schemas.schemas import ResumeAnalysisResponse,JDAnalysisResponse,ShrinkSummaryResponse
 import json
@@ -11,6 +11,7 @@ from langchain_core.output_parsers.pydantic import PydanticOutputParser
 from langchain_core.runnables.base import RunnableMap
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
+import re
 
 router = APIRouter()
 
@@ -38,6 +39,23 @@ def normalize_suggested_questions(raw_content):
         if s.strip()
     ]
 
+def normalize_skill(skill):
+    skill = skill.lower()
+
+    # remove brackets
+    skill = re.sub(r'\(.*?\)', '', skill)
+
+    # remove extra words
+    skill = skill.replace("programming", "").strip()
+
+    # remove special chars
+    skill = re.sub(r'[^a-z0-9+#\. ]', '', skill)
+
+    return skill.strip()
+
+def normalize_skills(skill_list):
+    return set(normalize_skill(s) for s in skill_list if s)
+
 @router.get("/process/jd_resume_match")
 async def process(suggester=Depends(get_question_suggester)):
     if "resume" not in memory_store or "jd" not in memory_store:
@@ -50,13 +68,19 @@ async def process(suggester=Depends(get_question_suggester)):
     resume_text = extract_text(resume_info["bytes"], resume_info["filename"])
     jd_text = extract_text(jd_info["bytes"], jd_info["filename"]) 
 
-    llm = ChatGroq(model="openai/gpt-oss-20b")
+    llm = ChatGroq(model="openai/gpt-oss-20b",temperature=0.1)
     pydantic_parser = PydanticOutputParser(pydantic_object=ResumeAnalysisResponse)
     fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are an expert recruiter, resume strategist, and proofreader."),
         ("user", """You will return JSON matching this schema:
         {format_instructions}
+
+    IMPORTANT:
+    - Extract ONLY technical skills (programming languages, frameworks, tools, cloud, databases).
+    - Return skills as a clean list.
+    - Do NOT include soft skills (like communication, leadership, etc.)
+    - Do NOT guess skills not present in the text.
 
         Then, analyze:
         --- JOB DESCRIPTION ---
@@ -171,9 +195,19 @@ async def process(suggester=Depends(get_question_suggester)):
 
     grammar = merged.get("Grammatical_Errors", [])
     spelling = merged.get("Spelling_Mistakes", [])
+    resume_skills_raw = merged.get("Extracted_Resume_Skills", [])
+    jd_skills_raw = merged.get("Extracted_JD_Skills", [])
 
+    resume_skills = normalize_skills(resume_skills_raw)
+    jd_skills = normalize_skills(jd_skills_raw)
+
+
+    score, matched, missing = compute_match_score(resume_skills, jd_skills)
+
+    merged["JD_MatchScore"] = format_score(score)
     merged["Grammatical_Errors"] = filter_grammar_errors(grammar, resume_text)
     merged["Spelling_Mistakes"] = filter_spelling_errors(spelling, resume_text)
+    merged["Client_Names"] = extract_client_names_advanced(resume_text)
 
     merged["Suggested_Questions"] = normalize_suggested_questions(reframmed_questions[0].content)
 
