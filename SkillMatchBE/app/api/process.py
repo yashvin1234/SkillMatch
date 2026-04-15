@@ -1,5 +1,11 @@
 from fastapi import APIRouter, HTTPException, Request, Depends
-from app.utils.text_extract import compute_match_score, extract_client_names_advanced, extract_text,filter_spelling_errors,filter_grammar_errors,format_score
+from app.utils.text_extract import (
+    extract_client_names_advanced,
+    extract_text,
+    filter_spelling_errors,
+    filter_grammar_errors,
+    format_score
+)
 from app.config import memory_store
 from app.schemas.schemas import ResumeAnalysisResponse,JDAnalysisResponse,ShrinkSummaryResponse
 import json
@@ -12,6 +18,13 @@ from langchain_core.runnables.base import RunnableMap
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 import re
+from app.utils.skill_engine import (
+    extract_skills,
+    compute_match_score_v2,
+    extract_experience,
+    compute_experience_score,
+    compute_final_score
+)
 
 router = APIRouter()
 
@@ -68,6 +81,10 @@ async def process(suggester=Depends(get_question_suggester)):
     resume_text = extract_text(resume_info["bytes"], resume_info["filename"])
     jd_text = extract_text(jd_info["bytes"], jd_info["filename"]) 
 
+    # ---------------- SKILL EXTRACTION ----------------
+    resume_skills = extract_skills(resume_text)
+    jd_skills = extract_skills(jd_text)
+
     llm = ChatGroq(model="openai/gpt-oss-20b",temperature=0.1)
     pydantic_parser = PydanticOutputParser(pydantic_object=ResumeAnalysisResponse)
     fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
@@ -76,17 +93,29 @@ async def process(suggester=Depends(get_question_suggester)):
         ("user", """You will return JSON matching this schema:
         {format_instructions}
 
-    IMPORTANT:
-    - Extract ONLY technical skills (programming languages, frameworks, tools, cloud, databases).
-    - Return skills as a clean list.
-    - Do NOT include soft skills (like communication, leadership, etc.)
-    - Do NOT guess skills not present in the text.
+        IMPORTANT:
+        CRITICAL INSTRUCTIONS (MUST FOLLOW STRICTLY):
+
+        1. You are NOT allowed to infer skills.
+        2. You MUST ONLY use the provided skill lists.
+        3. You MUST compute:
+
+        Key_Matches = intersection of Resume Skills and JD Skills  
+        Key_Gaps = JD Skills - Resume Skills  
+
+        4. DO NOT contradict the provided skills.
+        5. DO NOT say a skill is missing if it exists in Resume Skills.
+        6. Your explanation MUST align with the computed matches/gaps.
 
         Then, analyze:
         --- JOB DESCRIPTION ---
         {jd_text}
         --- RESUME ---
         {resume_text}
+        --- EXTRACTED JD SKILLS ---
+        {jd_skills}
+        --- EXTRACTED RESUME SKILLS ---
+        {resume_skills}
         """)
          ])
 
@@ -98,6 +127,8 @@ async def process(suggester=Depends(get_question_suggester)):
         RunnableMap({
             "jd_text": lambda x: x["jd_text"],
             "resume_text": lambda x: x["resume_text"],
+            "jd_skills": lambda x: x["jd_skills"],
+            "resume_skills": lambda x: x["resume_skills"],
         })
         | prompt_with_instructions
         | llm
@@ -106,7 +137,9 @@ async def process(suggester=Depends(get_question_suggester)):
 
     resp_task = chain.ainvoke({
         "jd_text": jd_text,
-        "resume_text": resume_text
+        "resume_text": resume_text,
+        "resume_skills": list(resume_skills),
+        "jd_skills": list(jd_skills)
     })
 
     pydantic_parser_shrink = PydanticOutputParser(pydantic_object=ShrinkSummaryResponse)
@@ -143,18 +176,23 @@ async def process(suggester=Depends(get_question_suggester)):
         | fixing_parser_shrink
     )
 
-    combined_text = f"{jd_text}" 
+    combined_text = f"{jd_text}\n{resume_text}"
     shrink_task = shrink_chain.ainvoke({
         "combined_text": combined_text
     })
 
     resp, shrinked_output = await asyncio.gather(resp_task, shrink_task)
     print('shrinked output:',shrinked_output.sentences)
-    suggested_questions = [
-    q
-    for query in shrinked_output.sentences
-    for q in suggester.suggest_questions(query, top_k=20)
-    ]
+    # suggested_questions = [
+    # q
+    # for query in shrinked_output.sentences
+    # for q in suggester.suggest_questions(query, top_k=20)
+    # ]
+    suggested_questions = list(set([
+        q
+        for query in shrinked_output.sentences
+        for q in suggester.suggest_questions(query, top_k=20)
+    ]))
     print('suggested questions:',suggested_questions)
 
 
@@ -195,26 +233,114 @@ async def process(suggester=Depends(get_question_suggester)):
 
     grammar = merged.get("Grammatical_Errors", [])
     spelling = merged.get("Spelling_Mistakes", [])
-    resume_skills_raw = merged.get("Extracted_Resume_Skills", [])
-    jd_skills_raw = merged.get("Extracted_JD_Skills", [])
+    
+    skill_score, matched, missing = compute_match_score_v2(resume_skills, jd_skills)
 
-    resume_skills = normalize_skills(resume_skills_raw)
-    jd_skills = normalize_skills(jd_skills_raw)
+    # ---------------- EXPERIENCE EXTRACTION ----------------
 
+    resume_exp = extract_experience(resume_text)
+    if resume_exp == 0:
+        text_lower = resume_text.lower()
 
-    score, matched, missing = compute_match_score(resume_skills, jd_skills)
+        if "senior" in text_lower:
+            resume_exp = 5
+        elif "engineer" in text_lower:
+            resume_exp = 3
+        elif len(resume_text.split()) > 800:
+            resume_exp = 3
+        else:
+            resume_exp = 2 # default to 2 years if no clear experience indicators are found
 
-    merged["JD_MatchScore"] = format_score(score)
+    jd_exp = extract_experience(jd_text)
+
+    exp_score = compute_experience_score(resume_exp, jd_exp)
+
+    # ---------------- FINAL SCORE ----------------
+
+    final_score = compute_final_score(skill_score, exp_score)
+
+    merged["JD_MatchScore"] = format_score(final_score)
+    merged["Skill_Score"] = skill_score
+    merged["Skill_Coverage"] = f"{len(matched)}/{len(jd_skills)}"
+    merged["Experience_Score"] = exp_score
+    merged["Resume_Experience"] = resume_exp
+    merged["JD_Required_Experience"] = jd_exp
+    merged["Matched_Skills"] = matched
+    merged["Missing_Skills"] = missing
+
+    # ---------------- FALLBACKS (ONLY IF LLM FAILS) ----------------
+    if not merged.get("Key_Matches"):
+        merged["Key_Matches"] = list(matched)
+
+    if not merged.get("Key_Gaps"):
+        merged["Key_Gaps"] = [f"Missing experience in {skill}" for skill in missing]
+
+    if not merged.get("Recommendations"):
+        merged["Recommendations"] = [
+            f"Improve experience in {skill}" for skill in missing
+        ]
+
+    # ---------------- HARD VALIDATION ----------------
+
+    # Fix Key_Matches → must be subset of matched
+    if "Key_Matches" in merged:
+        merged["Key_Matches"] = [
+            item for item in merged["Key_Matches"]
+            if any(skill.lower() in item.lower() for skill in matched)
+        ]
+
+    # Fix Key_Gaps → must be subset of missing
+    if "Key_Gaps" in merged:
+        merged["Key_Gaps"] = [
+            item for item in merged["Key_Gaps"]
+            if any(skill.lower() in item.lower() for skill in missing)
+        ]
+
+    if "Score_Explanation_Technical" in merged:
+        explanation = merged["Score_Explanation_Technical"]
+
+        # Remove wrong negatives
+        for skill in matched:
+            explanation = re.sub(
+                rf"(?i)(no|lack of|lacks).*{skill}",
+                f"experience present with {skill}",
+                explanation
+            )
+
+        # Add missing skills explicitly if not mentioned
+        for skill in missing:
+            if skill.lower() not in explanation.lower():
+                explanation += f" Missing exposure to {skill}."
+
+        merged["Score_Explanation_Technical"] = explanation
+    merged["Extracted_Resume_Skills"] = list(resume_skills)
+    merged["Extracted_JD_Skills"] = list(jd_skills)
     merged["Grammatical_Errors"] = filter_grammar_errors(grammar, resume_text)
     merged["Spelling_Mistakes"] = filter_spelling_errors(spelling, resume_text)
     merged["Client_Names"] = extract_client_names_advanced(resume_text)
 
-    merged["Suggested_Questions"] = normalize_suggested_questions(reframmed_questions[0].content)
+    questions = normalize_suggested_questions(reframmed_questions[0].content)
+    if not questions:
+        questions = suggested_questions[:10]
+    merged["Suggested_Questions"] = questions
 
-    key_gaps_clean = [str(item).replace("\n", " ") for item in merged.get("Key_Gaps", [])]
-    key_gaps_str = " ".join(key_gaps_clean)
+    key_gaps_list = merged.get("Key_Gaps") or []
+    key_gaps_str = " ".join(key_gaps_list)
 
-    suggest_course = suggester.suggest_courses(key_gaps_str, top_k=20,filter_value = 'resource')
+    suggest_course = suggester.suggest_courses(
+        key_gaps_str,
+        top_k=20,
+        filter_value='resource'
+    )
+
+    # fallback if empty
+    if not suggest_course:
+        suggest_course = suggester.suggest_courses(
+            " ".join(missing),
+            top_k=5,
+            filter_value='resource'
+        )
+
     merged['Suggest_course'] = suggest_course
 
     merged["Resume_Filename"] = resume_info.get("filename", "analysis-result").rsplit('.', 1)[0]
