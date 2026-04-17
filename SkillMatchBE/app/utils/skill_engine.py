@@ -1,5 +1,6 @@
 import re
 import datetime
+import json
 
 # -----------------------------
 # 1. YOUR SKILL DICTIONARY
@@ -111,34 +112,105 @@ def group_skills(skills):
 # 5. MATCH SCORE
 # -----------------------------
 
-def compute_match_score_v2(resume_skills, jd_skills):
+async def compute_match_score_v2(resume_skills: set, jd_skills: set, llm=None) -> tuple:
+    """
+    Compute skill match score using LLM semantic matching.
+    Falls back to normalized set intersection if LLM is unavailable or fails.
+
+    Returns:
+        (score: float, matched: list, missing: list)
+    """
     if not jd_skills:
-        return 0, [], []
+        return 0.0, [], []
 
-    matched = resume_skills & jd_skills
-    missing = jd_skills - resume_skills
-    
+    if llm is not None:
+        try:
+            # Canonical, stable inputs
+            resume_list = sorted(set(s.lower().strip() for s in resume_skills if s))
+            jd_list = sorted(set(s.lower().strip() for s in jd_skills if s))
 
-    jd_grouped = group_skills(jd_skills)
+            prompt = f"""You are a skill-matching classifier. Your only job is to decide, for each JD skill, whether the candidate's resume skills cover it.
 
-    importance = {
-        "advanced": 3,
-        "intermediate": 2,
-        "beginner": 1
-    }
+                ### Semantic equivalence rules
+                - Acronyms equal full names: "ml" = "machine learning", "aws" = "amazon web services", "k8s" = "kubernetes", "nlp" = "natural language processing"
+                - Aliases are equal: "react" = "reactjs" = "react.js", "node" = "node.js", "postgres" = "postgresql", "tf" = "tensorflow"
+                - A broader skill covers a narrower one: "python" covers "python scripting"; "llm fine-tuning" covers "model fine-tuning"
+                - Minor spelling/casing variants are equal: "rest api" = "restful apis", "css3" = "css"
+                - A general cloud platform covers its sub-services when no other match exists: "aws" covers "ec2", "s3", "lambda"
 
-    total = 0
-    max_total = 0
+                ### Few-shot examples
 
-    for level, skills in jd_grouped.items():
-        for skill in skills:
-            max_total += importance[level]
-            if skill in matched:
-                total += importance[level]
+                Example 1
+                Resume Skills: ["python", "aws", "machine learning", "sql"]
+                JD Skills: ["ml", "amazon web services", "python scripting", "nosql"]
+                Output:
+                {{"matched": ["ml", "amazon web services", "python scripting"], "missing": ["nosql"]}}
 
-    score = (total / max_total) * 10 if max_total else 0
+                Example 2
+                Resume Skills: ["react", "typescript", "node.js", "docker"]
+                JD Skills: ["reactjs", "ts", "express", "kubernetes"]
+                Output:
+                {{"matched": ["reactjs", "ts"], "missing": ["express", "kubernetes"]}}
 
-    return round(score, 2), list(matched), list(missing)
+                Example 3
+                Resume Skills: ["java", "spring boot", "postgresql", "rest api"]
+                JD Skills: ["java", "spring", "mysql", "restful apis", "graphql"]
+                Output:
+                {{"matched": ["java", "spring", "restful apis"], "missing": ["mysql", "graphql"]}}
+
+                ### Hard rules
+                - Every JD skill must appear in exactly one list — no omissions, no duplicates.
+                - Use the exact JD skill wording in both lists — never the resume wording.
+                - Do not add skills not in the JD list.
+                - Return ONLY the JSON object — no explanation, no markdown, no preamble.
+
+                ### Important
+                Create a plan first and then proceed for output.
+
+                ### Output format
+                {{"matched": ["<jd_skill>", ...], "missing": ["<jd_skill>", ...]}}
+
+                ### Input
+                Resume Skills: {resume_list}
+                JD Skills: {jd_list}"""
+
+            from langchain_core.messages import SystemMessage, HumanMessage
+            messages = [
+                SystemMessage(content="You are a precise skill-matching classifier. Return only valid JSON."),
+                HumanMessage(content=prompt),
+            ]
+
+            deterministic_llm = llm.bind(temperature=0)
+            raw = await deterministic_llm.ainvoke(messages)
+            content = raw.content.strip()
+
+            # Strip markdown fences if present
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+
+            parsed = json.loads(content)
+            matched = [s for s in parsed.get("matched", []) if s in jd_skills]
+            missing = [s for s in parsed.get("missing", []) if s in jd_skills]
+
+            # Ensure every JD skill is accounted for
+            accounted = set(matched) | set(missing)
+            for skill in jd_skills:
+                if skill not in accounted:
+                    missing.append(skill)
+
+            score = (len(matched) / len(jd_skills)) * 10 if jd_skills else 0.0
+            print(f"[LLM match] matched={len(matched)}, missing={len(missing)}, score={round(score, 2)}")
+            return round(score, 2), matched, missing
+
+        except Exception as e:
+            print(f"[WARN] LLM skill matching failed ({e}), falling back to set intersection")
+
+    # --- Fallback: normalized set intersection ---
+    matched = list(resume_skills & jd_skills)
+    missing = list(jd_skills - resume_skills)
+    score = (len(matched) / len(jd_skills)) * 10 if jd_skills else 0.0
+    return round(score, 2), matched, missing
 
 # -----------------------------
 # 6. EXPERIENCE EXTRACTION
@@ -221,4 +293,4 @@ def compute_experience_score(resume_exp, jd_exp):
 # -----------------------------
 
 def compute_final_score(skill_score, exp_score):
-    return round((0.7 * skill_score) + (0.3 * exp_score), 2)
+    return round((0.7 * skill_score) + (0.3 * exp_score), 1)

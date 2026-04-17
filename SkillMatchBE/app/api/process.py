@@ -86,51 +86,44 @@ async def _extract_skills_llm(resume_text: str, jd_text: str, llm) -> tuple[set,
     pydantic_parser = PydanticOutputParser(pydantic_object=SkillExtractionResponse)
     fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
 
-    format_instructions = fixing_parser.get_format_instructions()
-    user_content = f"""
-    You will return JSON matching this schema:
-    {format_instructions}
-    Your task is to analyze the given Job Description and extract all relevant skills, categorized into meaningful groups.
+    user_content = f"""You are a skill extraction engine. Extract skills explicitly mentioned or clearly implied in the Resume and Job Description below.
 
-    ### Instructions:
-    1. Carefully read the Job Description and Resume
-    2. Extract ONLY skills that are explicitly mentioned or clearly implied.
-    3. Do NOT hallucinate or add external skills.
-    4. Normalize similar skills (e.g., "stakeholder communication" and "working with stakeholders" → "Stakeholder Management").
-    5. Group skills into the following categories:
+### Rules
+1. Extract ONLY skills present in the text — do NOT invent or infer skills not mentioned.
+2. Each skill must be concise: 3 words maximum.
+3. Normalize equivalent phrasings to a single canonical form:
+   - "stakeholder communication" / "working with stakeholders" → "Stakeholder Management"
+   - "ML" / "machine learning" → "Machine Learning"
+4. Assign each skill to exactly one category — no duplicates across categories.
+5. Populate both `resume_skills` and `jd_skills` independently from their respective texts.
 
-    ### Categories:
-    - Technical Skills
-    - GenAI / AI Skills
-    - Data Skills
-    - Product / Business Skills
-    - Agile / Process Skills
-    - Soft Skills
+### Categories (use these exact names)
+- Technical Skills
+- GenAI / AI Skills
+- Data Skills
+- Product / Business Skills
+- Agile / Process Skills
+- Soft Skills
 
-    6. Avoid duplication across categories.
-    7 Each skill should be concise (3 words max).
-    
-    --- RESUME ---
-    {resume_text}
-    --- JOB DESCRIPTION ---
-    { jd_text}
+### Output format (return ONLY this JSON — no explanation, no markdown, no preamble)
+{fixing_parser.get_format_instructions()}
 
-    The output is as follows:
-    {{
-        "resume_skills":[<list of skills extracted from resume>],
-        "jd_skills":[<list of skills extracted from Job description>]
-    }}
-    """
-    
+### Input
+--- RESUME ---
+{resume_text}
+
+--- JOB DESCRIPTION ---
+{jd_text}"""
+
     messages = [
-        SystemMessage(content="You are an expert AI assistant specializing in extracting structured skills from job descriptions."),
+        SystemMessage(content="You are a precise skill extraction engine. Return only valid JSON."),
         HumanMessage(content=user_content),
     ]
 
     print("*****************PROMPT*****************")
     print(user_content)
 
-    raw = llm.invoke(messages)
+    raw = await llm.bind(temperature=0).ainvoke(messages)
     print("***************** RAW LLM SKILL RESPONSE ************")
     print(raw)
 
@@ -265,6 +258,42 @@ def _resolve_resume_experience(resume_text: str) -> int:
     return exp
 
 
+async def _extract_client_names_llm(resume_text: str, llm) -> list[str]:
+    """Extract client/company names from the resume using the LLM. Falls back to rule-based on failure."""
+    messages = [
+        SystemMessage(content="You are an expert resume analyst. Extract only company or client names that are explicitly mentioned in the resume text."),
+        HumanMessage(content=f"""Analyze the resume below and extract all client or company names the candidate has worked at or for.
+
+            Rules:
+            1. Only include names that are explicitly present in the text — do NOT invent or infer.
+            2. Include employers, clients, and project clients.
+            3. Exclude generic terms like "client", "company", "organization", "MNC", etc.
+            4. Return a valid JSON array of strings only, e.g. ["Accenture", "JPMorgan Chase", "Google"].
+            5. If none are found, return an empty array: []
+            Create a plan first and then proceed for the output.
+            --- RESUME ---
+            {resume_text}
+            """),
+    ]
+
+    try:
+        raw = await llm.ainvoke(messages)
+        content = raw.content.strip()
+        print("********************CLIENT NAME****************")
+        print(content)
+        # Strip markdown code fences if present
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL).strip()
+        names = json.loads(content)
+        if isinstance(names, list) and names:
+            return [str(n).strip() for n in names if str(n).strip()]
+        else:
+            return []
+    except Exception as e:
+        print(f"[WARN] LLM client name extraction failed ({e}), falling back to rule-based")
+        return []
+    
+
+
 def _apply_hard_validation(merged: dict, matched: set, missing: set) -> dict:
     if "Key_Matches" in merged:
         merged["Key_Matches"] = [
@@ -350,7 +379,7 @@ async def process(suggester=Depends(get_question_suggester)):
     questions = normalize_suggested_questions(reframed_raw.content) or suggested_questions[:10]
 
     # ---------------- SCORING ----------------
-    skill_score, matched, missing = compute_match_score_v2(resume_skills, jd_skills)
+    skill_score, matched, missing = await compute_match_score_v2(resume_skills, jd_skills, llm)
     resume_exp = _resolve_resume_experience(resume_text)
     jd_exp = extract_experience(jd_text)
     exp_score = compute_experience_score(resume_exp, jd_exp)
@@ -371,7 +400,7 @@ async def process(suggester=Depends(get_question_suggester)):
 
     # Fallbacks (only if LLM left fields empty)
     if not merged.get("Key_Matches"):
-        merged["Key_Matches"] = list(matched)
+        merged["Key_Matches"] = matched
     if not merged.get("Key_Gaps"):
         merged["Key_Gaps"] = [f"Missing experience in {skill}" for skill in missing]
     if not merged.get("Recommendations"):
@@ -383,7 +412,7 @@ async def process(suggester=Depends(get_question_suggester)):
     merged["Extracted_JD_Skills"] = list(jd_skills)
     merged["Grammatical_Errors"] = filter_grammar_errors(merged.get("Grammatical_Errors", []), resume_text)
     merged["Spelling_Mistakes"] = filter_spelling_errors(merged.get("Spelling_Mistakes", []), resume_text)
-    merged["Client_Names"] = extract_client_names_advanced(resume_text)
+    merged["Client_Names"] = await _extract_client_names_llm(resume_text, llm)
     merged["Suggested_Questions"] = questions
 
     # ---------------- COURSE SUGGESTIONS ----------------
