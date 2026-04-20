@@ -25,6 +25,7 @@ from app.utils.skill_engine import (
     compute_match_score_v2,
     extract_experience,
     compute_experience_score,
+    compute_experience_score_v2,
     compute_final_score
 )
 
@@ -86,44 +87,60 @@ async def _extract_skills_llm(resume_text: str, jd_text: str, llm) -> tuple[set,
     pydantic_parser = PydanticOutputParser(pydantic_object=SkillExtractionResponse)
     fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
 
-    user_content = f"""You are a skill extraction engine. Extract skills explicitly mentioned or clearly implied in the Resume and Job Description below.
+    user_content = f"""
+            You are a skill extraction engine.
 
-### Rules
-1. Extract ONLY skills present in the text — do NOT invent or infer skills not mentioned.
-2. Each skill must be concise: 3 words maximum.
-3. Normalize equivalent phrasings to a single canonical form:
-   - "stakeholder communication" / "working with stakeholders" → "Stakeholder Management"
-   - "ML" / "machine learning" → "Machine Learning"
-4. Assign each skill to exactly one category — no duplicates across categories.
-5. Populate both `resume_skills` and `jd_skills` independently from their respective texts.
+            ### Objective
+            Extract skills from the Resume and Job Description.
 
-### Categories (use these exact names)
-- Technical Skills
-- GenAI / AI Skills
-- Data Skills
-- Product / Business Skills
-- Agile / Process Skills
-- Soft Skills
+            ### Extraction Rules
+                Extract ONLY:
+                    Explicitly mentioned skills
+                    Strongly implied skills from tools/frameworks
+                Parse the whole resume / job description to extract the skills, donot just parse in a specific area. 
 
-### Output format (return ONLY this JSON — no explanation, no markdown, no preamble)
-{fixing_parser.get_format_instructions()}
+            ### Rules
+            - Do NOT invent skills.
+            - Normalize skills to short canonical forms (max 3 words).
+            - Convert to lowercase.
+            - Deduplicate.
+            - Prefer commonly accepted industry terms.
+            - Treat acronyms and full forms as the same skill (use full form where possible).
+            - Do NOT categorize, score, or explain.
 
-### Input
---- RESUME ---
-{resume_text}
+            ### Output Format (STRICT JSON ONLY)
+           {{
+            "resume_skills": ["skill1", "skill2"],
+            "jd_skills": ["skill1", "skill2"]
+            }}
 
---- JOB DESCRIPTION ---
-{jd_text}"""
 
+
+        ### Output format (return ONLY this JSON — no explanation, no markdown, no preamble)
+        {fixing_parser.get_format_instructions()}
+
+        ### Input
+        --- RESUME ---
+        {resume_text}
+
+        --- JOB DESCRIPTION ---
+        {jd_text}"""
+    
+
+    system_prompt = """
+        You are a deterministic information extraction engine.
+        You always return valid JSON.
+        You never vary output for the same input.
+    """
     messages = [
-        SystemMessage(content="You are a precise skill extraction engine. Return only valid JSON."),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=user_content),
     ]
 
     print("*****************PROMPT*****************")
     print(user_content)
 
-    raw = await llm.bind(temperature=0).ainvoke(messages)
+    raw = await llm.bind(temperature=0, top_p=1, frequency_penalty=0, presence_penalty=0).ainvoke(messages)
     print("***************** RAW LLM SKILL RESPONSE ************")
     print(raw)
 
@@ -141,7 +158,8 @@ async def _extract_skills_llm(resume_text: str, jd_text: str, llm) -> tuple[set,
         print("[WARN] LLM returned empty skill lists, falling back to extract_skills()")
         return extract_skills(resume_text), extract_skills(jd_text)
 
-    return normalize_skills(parsed.resume_skills), normalize_skills(parsed.jd_skills)
+    return parsed.resume_skills, parsed.jd_skills
+    # return normalize_skills(parsed.resume_skills), normalize_skills(parsed.jd_skills)
 
 
 def _build_analysis_chain(llm):
@@ -262,25 +280,35 @@ async def _extract_client_names_llm(resume_text: str, llm) -> list[str]:
     """Extract client/company names from the resume using the LLM. Falls back to rule-based on failure."""
     messages = [
         SystemMessage(content="You are an expert resume analyst. Extract only company or client names that are explicitly mentioned in the resume text."),
-        HumanMessage(content=f"""Analyze the resume below and extract all client or company names the candidate has worked at or for.
-
+        HumanMessage(content=f"""
+            Task:
+                Review the provided resume and extract only client names that are explicitly mentioned by their real company or brand name.
             Rules:
-            1. Only include names that are explicitly present in the text — do NOT invent or infer.
-            2. Include employers, clients, and project clients.
-            3. Exclude generic terms like "client", "company", "organization", "MNC", etc.
-            4. Return a valid JSON array of strings only, e.g. ["Accenture", "JPMorgan Chase", "Google"].
-            5. If none are found, return an empty array: []
-            Create a plan first and then proceed for the output.
+                1. List only non‑anonymised client names (e.g., “Google”, “Walmart”, “Accenture”).
+                2. Do NOT infer, guess, or deduce client identities from descriptions, industries, locations, or Fortune 500 references.
+                3. Exclude anonymised or generic descriptions, such as:
+
+                    “A startup from India/UK”
+                    “A Fortune 500 company”
+                    “A leading S2P company”
+
+
+                4. Do not include employers, tools, technologies, certification providers, or educational institutions unless they are explicitly stated as clients.
+                4a. Donot include company names whose products opr tools are used for integrations. Only include the company names with whome the employee has worked.
+                5. If none are found, return an empty array: []
+            
+            Create/write a plan and then produce the output.
+
             --- RESUME ---
             {resume_text}
             """),
     ]
 
     try:
-        raw = await llm.ainvoke(messages)
+        raw = await llm.bind(temperature=0).ainvoke(messages)
         content = raw.content.strip()
         print("********************CLIENT NAME****************")
-        print(content)
+        print(raw)
         # Strip markdown code fences if present
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL).strip()
         names = json.loads(content)
@@ -344,7 +372,7 @@ async def process(suggester=Depends(get_question_suggester)):
 
     # ---------------- SKILL EXTRACTION (LLM) ----------------
     # llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3)
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
     
     resume_skills, jd_skills = await _extract_skills_llm(resume_text, jd_text, llm)
     print("***************** RESUME SKILLS ************")
@@ -364,6 +392,7 @@ async def process(suggester=Depends(get_question_suggester)):
     })
     resp, shrinked_output = await asyncio.gather(resp_task, shrink_task)
     print("shrinked output:", shrinked_output.sentences)
+    print("resp: ", resp)
 
     # ---------------- QUESTION SUGGESTION + REFRAMING ----------------
     suggested_questions = list(set(
