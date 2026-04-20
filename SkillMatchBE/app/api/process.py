@@ -258,23 +258,36 @@ def _resolve_resume_experience(resume_text: str) -> int:
     return exp
 
 
+def extract_json_array(text: str):
+    match = re.search(r"\[.*?\]", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except:
+            return []
+    return []
 async def _extract_client_names_llm(resume_text: str, llm) -> list[str]:
+    # 5. If none are found, return an empty array: []
     """Extract client/company names from the resume using the LLM. Falls back to rule-based on failure."""
     messages = [
         SystemMessage(content="You are an expert resume analyst. Extract only company or client names that are explicitly mentioned in the resume text."),
-        HumanMessage(content=f"""Analyze the resume below and extract all client or company names the candidate has worked at or for.
-
-            Rules:
-            1. Only include names that are explicitly present in the text — do NOT invent or infer.
-            2. Include employers, clients, and project clients.
-            3. Exclude generic terms like "client", "company", "organization", "MNC", etc.
-            4. Return a valid JSON array of strings only, e.g. ["Accenture", "JPMorgan Chase", "Google"].
-            5. If none are found, return an empty array: []
-            Create a plan first and then proceed for the output.
+        HumanMessage(content=f"""
+            Analyze the resume and extract client/company names.
+            
+            STRICT RULES:
+            - Return ONLY a valid JSON array.
+            - Do NOT include explanations, plans, or markdown.
+            - Do NOT wrap in ```json```
+            - Do NOT include tools, technologies, or products (e.g., AWS, Oracle, Jira).
+            - Only include actual company or client organizations.
+            
+            Example:
+            ["Accenture", "JPMorgan Chase"]
+            
             --- RESUME ---
             {resume_text}
-            """),
-    ]
+            """)
+                ]
 
     try:
         raw = await llm.ainvoke(messages)
@@ -283,7 +296,7 @@ async def _extract_client_names_llm(resume_text: str, llm) -> list[str]:
         print(content)
         # Strip markdown code fences if present
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL).strip()
-        names = json.loads(content)
+        names = extract_json_array(content)
         if isinstance(names, list) and names:
             return [str(n).strip() for n in names if str(n).strip()]
         else:
