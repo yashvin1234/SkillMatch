@@ -80,3 +80,13 @@ class ShrinkSummaryResponse(BaseModel):
         ...,
         description="List of concise sentences summarizing key technologies, tools, skills, and domains."
     )
+
+class SkillExtractionResponse(BaseModel):
+    resume_skills: List[str] = Field(
+        default_factory=list,
+        description="List of explicit, concrete technical skills found in the resume (tools, frameworks, languages, platforms). Lowercase only. Do not infer skills not present in the text."
+    )
+    jd_skills: List[str] = Field(
+        default_factory=list,
+        description="List of explicit, concrete technical skills required by the job description (tools, frameworks, languages, platforms). Lowercase only. Do not infer skills not present in the text."
+    )
