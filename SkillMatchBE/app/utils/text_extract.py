@@ -152,7 +152,6 @@ def extract_client_names_advanced(resume_text):
     if not clients:
         clients += extract_using_patterns(resume_text)
 
-
     # Step 3: cleanup + validation
     clients = clean_clients(clients, resume_text)
 
@@ -170,10 +169,17 @@ def compute_match_score(resume_skills, jd_skills):
 
     return round(score, 1), list(matched), list(missing)
 
-def format_score(score):
-    if score >= 8:
-        return f"{score}/10 - Strong match"
-    elif score >= 5:
-        return f"{score}/10 - Moderate match"
+
+def format_score(score: float) -> str:
+    """
+    Format a 0–100 scale score into a human-readable string.
+    score is produced by compute_final_score which blends
+    skill_score (0-100) and exp_score (0-100).
+    """
+    score = round(score, 1)
+    if score >= 75:
+        return f"{score}/100 - Strong match"
+    elif score >= 50:
+        return f"{score}/100 - Moderate match"
     else:
-        return f"{score}/10 - Weak match"
+        return f"{score}/100 - Weak match"

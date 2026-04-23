@@ -118,19 +118,30 @@ const ResumeJDResult: React.FC = () => {
   }
 
 
+  // FIX: JD_MatchScore is now on a 0-100 scale ("29.2/100 - Weak match").
+  // Parse the raw number, use it directly as scorePercent (already 0-100).
+  // Fall back to JD_MatchScore_Raw if available.
   const parseScore = (scoreStr: string) => {
     if (!scoreStr) return 0;
     const match = scoreStr.match(/^(\d+(\.\d+)?)/);
     return match ? parseFloat(match[1]) : 0;
   };
-  const rawScore = parseScore(resultData.JD_MatchScore);
-  const scorePercent = Math.min(100, Math.max(0, Math.round((rawScore / 10) * 100)));
+
+  // Prefer the explicit raw value, fall back to parsing the formatted string
+  const rawScore: number =
+    typeof resultData.JD_MatchScore_Raw === "number"
+      ? resultData.JD_MatchScore_Raw
+      : parseScore(resultData.JD_MatchScore);
+
+  // rawScore is 0-100 — use directly for the progress ring
+  const scorePercent = Math.min(100, Math.max(0, Math.round(rawScore)));
+
   let ringColor = "#f87171";
   let label = "Low Compatibility";
-  if (rawScore >= 7.5) {
+  if (rawScore >= 75) {
     ringColor = "#22c55e";
     label = "High Compatibility";
-  } else if (rawScore >= 5) {
+  } else if (rawScore >= 50) {
     ringColor = "#facc15";
     label = "Moderate Compatibility";
   }
@@ -235,7 +246,7 @@ const ResumeJDResult: React.FC = () => {
             <div className="circle-summary small-circle-summary">
               <CircularProgressbar
                 value={scorePercent}
-                text={`${rawScore}/10`}
+                text={`${rawScore}/100`}
                 styles={buildStyles({
                   textColor: "#1e293b",
                   pathColor: ringColor,
@@ -455,8 +466,6 @@ const ResumeJDResult: React.FC = () => {
                   <p className="empty-state">No course recommendations available.</p>
                 )
               }
-
-
             </div>
           </InfoCard>
         </div>
