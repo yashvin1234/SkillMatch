@@ -279,7 +279,7 @@ def _resolve_resume_experience(resume_text: str) -> int:
 async def _extract_client_names_llm(resume_text: str, llm) -> list[str]:
     """Extract client/company names from the resume using the LLM. Falls back to rule-based on failure."""
     messages = [
-        SystemMessage(content="You are an expert resume analyst. Extract only company or client names that are explicitly mentioned in the resume text."),
+        SystemMessage(content="You are a strict information extraction engine. Follow rules exactly."),
         HumanMessage(content=f"""
             Task:
                 Review the provided resume and extract only client names that are explicitly mentioned by their real company or brand name.
@@ -296,8 +296,11 @@ async def _extract_client_names_llm(resume_text: str, llm) -> list[str]:
                 4. Do not include employers, tools, technologies, certification providers, or educational institutions unless they are explicitly stated as clients.
                 4a. Donot include company names whose products opr tools are used for integrations. Only include the company names with whome the employee has worked.
                 5. If none are found, return an empty array: []
+                6. If there is ANY doubt whether a name is anonymised or generic, DO NOT include it.
+                Prefer returning [] over including uncertain entries.
             
-            Create/write a plan and then produce the output.
+            Create a plan and then produce the output.
+            Think.
 
             --- RESUME ---
             {resume_text}
@@ -372,7 +375,7 @@ async def process(suggester=Depends(get_question_suggester)):
 
     # ---------------- SKILL EXTRACTION (LLM) ----------------
     # llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3)
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
     
     resume_skills, jd_skills = await _extract_skills_llm(resume_text, jd_text, llm)
     print("***************** RESUME SKILLS ************")
