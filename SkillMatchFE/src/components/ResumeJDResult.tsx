@@ -34,15 +34,16 @@ const InfoCard: React.FC<InfoCardProps> = ({
   </div>
 );
 
-// Course card UI
+// ── UPDATED: Course type now matches new backend fields ──────────────────────
 type CourseRecommendation = {
-  skillArea: string;
-  topic: string;
-  duration: string;
-  url: string;
-  objective: string;
+  skillArea: string;   // ← c.category
+  topic: string;       // ← c.topic
+  duration: string;    // ← c.level  (Course Level; "Duration" no longer exists)
+  url: string;         // ← c.url
+  objective: string;   // ← c.course (Pathway Display Name)
 };
 
+// ── UPDATED: Labels updated to match new fields ──────────────────────────────
 const CourseCard: React.FC<{ course: CourseRecommendation }> = ({ course }) => (
   <div className="course-card">
     <div className="course-header">
@@ -51,10 +52,10 @@ const CourseCard: React.FC<{ course: CourseRecommendation }> = ({ course }) => (
     </div>
     <div className="course-details">
       <div>
-        <strong>Duration:</strong> {course.duration}
+        <strong>Level:</strong> {course.duration}
       </div>
       <div>
-        <strong>Objective:</strong>{" "}
+        <strong>Course:</strong>{" "}
         <span style={{ whiteSpace: "pre-wrap" }}>{course.objective}</span>
       </div>
     </div>
@@ -100,8 +101,6 @@ const ResumeJDResult: React.FC = () => {
     }, 0);
   };
 
-
-
   if (!resultData) {
     return (
       <div className="result-container">
@@ -117,31 +116,26 @@ const ResumeJDResult: React.FC = () => {
     );
   }
 
-
-  // FIX: JD_MatchScore is now on a 0-100 scale ("29.2/100 - Weak match").
-  // Parse the raw number, use it directly as scorePercent (already 0-100).
-  // Fall back to JD_MatchScore_Raw if available.
   const parseScore = (scoreStr: string) => {
     if (!scoreStr) return 0;
     const match = scoreStr.match(/^(\d+(\.\d+)?)/);
     return match ? parseFloat(match[1]) : 0;
   };
 
-  // Prefer the explicit raw value, fall back to parsing the formatted string
   const rawScore: number =
     typeof resultData.JD_MatchScore_Raw === "number"
       ? resultData.JD_MatchScore_Raw
       : parseScore(resultData.JD_MatchScore);
 
-  // rawScore is 0-100 — use directly for the progress ring
-  const scorePercent = Math.min(100, Math.max(0, Math.round(rawScore)));
+  const scorePercent = Math.min(100, Math.max(0, Math.round(rawScore * 10)));
 
   let ringColor = "#f87171";
   let label = "Low Compatibility";
-  if (rawScore >= 75) {
+
+  if (rawScore >= 7.5) {
     ringColor = "#22c55e";
     label = "High Compatibility";
-  } else if (rawScore >= 50) {
+  } else if (rawScore >= 5) {
     ringColor = "#facc15";
     label = "Moderate Compatibility";
   }
@@ -167,65 +161,15 @@ const ResumeJDResult: React.FC = () => {
     ? resultData.Suggested_Questions
     : [];
 
-
-  // Dynamic course recommendations extraction with URL parsing from multiline course string
+  // ── FIXED: Read structured fields directly instead of parsing multiline blob ──
   const courseRecommendations: CourseRecommendation[] = Array.isArray(resultData.Suggest_course)
-    ? resultData.Suggest_course.map((c: any) => {
-      const lines = c.course.split("\n").map((l: string) => l.trim());
-
-      const skillAreaLine = lines.find((line: string) =>
-        line.toLowerCase().startsWith("skill area:")
-      );
-      const subSkillLine = lines.find((line: string) =>
-        line.toLowerCase().startsWith("sub-skill:")
-      );
-      const durationLine = lines.find((line: string) =>
-        line.toLowerCase().startsWith("duration:")
-      );
-      const learningObjectivesLine = lines.find((line: string) =>
-        line.toLowerCase().startsWith("learning objectives:")
-      );
-      const recommendedResourceLineIndex = lines.findIndex((line: string) =>
-        line.toLowerCase().startsWith("recommended resource:")
-      );
-
-      // Extract URL from recommended resource line or subsequent lines
-      let url = "#";
-      if (recommendedResourceLineIndex !== -1) {
-        const resLine = lines[recommendedResourceLineIndex];
-        const urlMatch = resLine.match(/(https?:\/\/[^\s]+)/);
-        if (urlMatch) {
-          url = urlMatch[0];
-        } else if (lines.length > recommendedResourceLineIndex + 1) {
-          for (let i = recommendedResourceLineIndex + 1; i < lines.length; i++) {
-            const possibleUrl = lines[i];
-            if (possibleUrl.startsWith("http://") || possibleUrl.startsWith("https://")) {
-              url = possibleUrl;
-              break;
-            }
-          }
-        }
-      } else {
-        // fallback find first url in any line
-        for (const line of lines) {
-          const uMatch = line.match(/(https?:\/\/[^\s]+)/);
-          if (uMatch) {
-            url = uMatch[0];
-            break;
-          }
-        }
-      }
-
-      return {
-        skillArea: skillAreaLine ? skillAreaLine.split(":")[1].trim() : "N/A",
-        topic: subSkillLine ? subSkillLine.split(":")[1].trim() : "N/A",
-        duration: durationLine ? durationLine.split(":")[1].trim() : "N/A",
-        url,
-        objective: learningObjectivesLine
-          ? learningObjectivesLine.split(":")[1].trim()
-          : "No learning objectives provided.",
-      };
-    })
+    ? resultData.Suggest_course.map((c: any) => ({
+        skillArea: c.category || "N/A",
+        topic: c.topic || c.course || "N/A",
+        duration: c.level || "N/A",
+        url: c.url || "#",
+        objective: c.course || "No details provided.",
+      }))
     : [];
 
   return (
@@ -246,7 +190,7 @@ const ResumeJDResult: React.FC = () => {
             <div className="circle-summary small-circle-summary">
               <CircularProgressbar
                 value={scorePercent}
-                text={`${rawScore}/100`}
+                text={`${rawScore}/10`}
                 styles={buildStyles({
                   textColor: "#1e293b",
                   pathColor: ringColor,
@@ -451,21 +395,19 @@ const ResumeJDResult: React.FC = () => {
         <div className="course-recommendations-section" style={{ marginTop: "2rem" }}>
           <InfoCard icon="🎓" title="Course Recommendations" color="#3bb273">
             <div className="course-cards-row">
-              {
-                courseRecommendations.length > 0 ? (
+              {courseRecommendations.length > 0 ? (
+                courseRecommendations
+                  .filter((course) => course.url && course.url !== "#" && course.url.trim() !== "")
+                  .length > 0 ? (
                   courseRecommendations
                     .filter((course) => course.url && course.url !== "#" && course.url.trim() !== "")
-                    .length > 0 ? (
-                    courseRecommendations
-                      .filter((course) => course.url && course.url !== "#" && course.url.trim() !== "")
-                      .map((course, idx) => <CourseCard key={idx} course={course} />)
-                  ) : (
-                    <p className="empty-state">No valid course links available.</p>
-                  )
+                    .map((course, idx) => <CourseCard key={idx} course={course} />)
                 ) : (
-                  <p className="empty-state">No course recommendations available.</p>
+                  <p className="empty-state">No valid course links available.</p>
                 )
-              }
+              ) : (
+                <p className="empty-state">No course recommendations available.</p>
+              )}
             </div>
           </InfoCard>
         </div>

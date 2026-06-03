@@ -8,8 +8,10 @@ import json
 #
 # All intermediate scores are on a 0–100 scale so that weighted combinations
 # are mathematically meaningful.
+# FINAL SCORE  = 0.70 × skill_score  +  0.30 × exp_score  → divided by 10
 #
-# FINAL SCORE  = 0.70 × skill_score  +  0.30 × exp_score
+# Output scale: 0.0 – 10.0
+# All intermediate scores remain on 0–100 scale internally.
 #
 # skill_score  (computed in p.py, passed in here)
 #   = (matched + 0.4 × partial) / total_jd_skills × 100
@@ -549,27 +551,26 @@ Output format:
 
 
 # =============================================================================
-# 10. FINAL COMBINED SCORE  (0–100)
+# 10. FINAL COMBINED SCORE  
 # =============================================================================
 
 def compute_final_score(skill_score: float, exp_score: float) -> float:
     """
     Combine skill coverage score and experience score into a single
-    compatibility score.
+    compatibility score out of 10.
 
     BOTH inputs must be on the 0–100 scale:
       skill_score : computed in p.py  → (matched + 0.4×partial) / total × 100
       exp_score   : computed here     → compute_experience_score() returns 0–100
 
     Weights: Skills 70 %, Experience 30 %.
-    Skills dominate because they are the most direct signal of fit.
-    Experience adjusts for seniority / depth but should not override strong skills.
 
     Examples:
-      Perfect skills + perfect exp  → (0.7×100) + (0.3×100) = 100.0
-      Perfect skills + weak exp     → (0.7×100) + (0.3×20)  =  76.0
-      Weak skills   + perfect exp   → (0.7×20)  + (0.3×100) =  44.0
-      Average both                  → (0.7×65)  + (0.3×70)  =  66.5
+      Perfect skills + perfect exp  → (0.7×100) + (0.3×100) = 100.0 → 10.0
+      Perfect skills + weak exp     → (0.7×100) + (0.3×20)  =  76.0 →  7.6
+      Weak skills   + perfect exp   → (0.7×20)  + (0.3×100) =  44.0 →  4.4
+      Average both                  → (0.7×65)  + (0.3×70)  =  66.5 →  6.7
     """
-    score = round((0.70 * skill_score) + (0.30 * exp_score), 1)
-    return max(0.0, min(100.0, score))   # clamp to [0, 100]
+    raw = (0.70 * skill_score) + (0.30 * exp_score)  # 0–100
+    out_of_10 = round(raw / 10, 1)                    # 0–10
+    return max(0.0, min(10.0, out_of_10))

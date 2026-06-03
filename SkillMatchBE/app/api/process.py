@@ -1,10 +1,13 @@
+# scoring logic changed to /10 in this code
+# latest refined llm usage code — all scoring fixes applied
+# using llm to generate interview questions
+
 from fastapi import APIRouter, HTTPException, Request, Depends
 from app.utils.text_extract import (
     extract_client_names_advanced,
     extract_text,
     filter_spelling_errors,
     filter_grammar_errors,
-    format_score,
 )
 from app.config import memory_store
 from app.schemas.schemas import (
@@ -27,11 +30,13 @@ from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage
 import re
+
 from app.utils.skill_engine import (
     extract_skills,
     compute_match_score_v2,
     extract_experience,
     compute_experience_score,
+    compute_experience_score_v2,
     compute_final_score,
 )
 
@@ -47,7 +52,7 @@ def get_question_suggester(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# LLM + Embedder factories  (single source, frozen settings)
+# LLM + Embedder factories
 # ---------------------------------------------------------------------------
 
 def _make_llm() -> ChatOpenAI:
@@ -60,12 +65,12 @@ def _make_llm() -> ChatOpenAI:
 
 
 def _make_embedder() -> OpenAIEmbeddings:
-    """text-embedding-3-small: cheap, fast, accurate enough at 0.85 threshold."""
+    """text-embedding-3-small: cheap, fast, accurate enough."""
     return OpenAIEmbeddings(model="text-embedding-3-small")
 
 
 # ---------------------------------------------------------------------------
-# Content-hash cache  (same resume+JD → identical result every time)
+# Content-hash cache
 # ---------------------------------------------------------------------------
 
 def _content_hash(resume_text: str, jd_text: str) -> str:
@@ -77,23 +82,37 @@ def _content_hash(resume_text: str, jd_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def normalize_suggested_questions(raw_content: str) -> list[str]:
+    # Step 1: strip markdown fences
+    cleaned = _clean_llm_json(raw_content)
+
+    # Step 2: try JSON parse on cleaned content
     try:
-        arr = json.loads(raw_content)
+        arr = json.loads(cleaned)
         if isinstance(arr, list):
-            return [str(i) for i in arr]
+            return [str(i).strip().strip('"').strip("'")
+                    for i in arr if str(i).strip()]
     except Exception:
         pass
+
+    # Step 3: try literal eval
     try:
-        arr = ast.literal_eval(raw_content)
+        arr = ast.literal_eval(cleaned)
         if isinstance(arr, list):
-            return [str(i) for i in arr]
+            return [str(i).strip().strip('"').strip("'")
+                    for i in arr if str(i).strip()]
     except Exception:
         pass
-    return [
-        s.strip().strip('"').strip("'")
-        for s in raw_content.replace('[', '').replace(']', '').split('\n')
-        if s.strip()
-    ]
+
+    # Step 4: last resort — line by line, skip fence lines
+    results = []
+    for line in cleaned.split('\n'):
+        line = line.strip().strip('"').strip("'").strip(',').strip()
+        if not line or line in ['[', ']', '```', '```json']:
+            continue
+        if line.startswith('```'):
+            continue
+        results.append(line)
+    return results
 
 
 def _clean_llm_json(raw_content: str) -> str:
@@ -105,811 +124,33 @@ def _clean_llm_json(raw_content: str) -> str:
     return content.strip()
 
 
-# =============================================================================
-# LAYER 1 — Skill normalisation
-# =============================================================================
-
-SKILL_ALIASES: dict[str, str] = {
-    # ── Languages ──────────────────────────────────────────────────────────
-    "js":                               "javascript",
-    "ts":                               "typescript",
-    "java script":                      "javascript",
-    "type script":                      "typescript",
-    "py":                               "python",
-    "golang":                           "go",
-    "golang language":                  "go",
-    "c sharp":                          "c#",
-    "dotnet":                           ".net",
-    "dot net":                          ".net",
-    ".net core":                        ".net",
-    "asp.net":                          ".net",
-    "asp.net core":                     ".net",
-    "net framework":                    ".net",
-
-    # ── AI / ML ────────────────────────────────────────────────────────────
-    "ml":                               "machine learning",
-    "ai":                               "artificial intelligence",
-    "dl":                               "deep learning",
-    "nlp":                              "natural language processing",
-    "natural language proc":            "natural language processing",
-    "ai/ml":                            "ai/ml development",
-    "aiml":                             "ai/ml development",
-    "ai ml":                            "ai/ml development",
-    "machine learning development":     "ai/ml development",
-    "ai development":                   "ai/ml development",
-    "ml development":                   "ai/ml development",
-    "ai/ml application development":    "ai/ml development",
-    "ai/ml applications":               "ai/ml development",
-    "artificial intelligence development": "ai/ml development",
-
-    # ── LLMs ───────────────────────────────────────────────────────────────
-    "llm":                              "large language models",
-    "llms":                             "large language models",
-    "large language model":             "large language models",
-
-    # ── Generative AI ──────────────────────────────────────────────────────
-    "gen ai":                           "generative ai",
-    "genai":                            "generative ai",
-
-    # ── Cloud ──────────────────────────────────────────────────────────────
-    "aws lambda":                       "aws",
-    "amazon web services":              "aws",
-    "aws basics":                       "aws",
-    "aws services":                     "aws",
-    "amazon aws":                       "aws",
-    "gcp":                              "google cloud platform",
-    "google cloud":                     "google cloud platform",
-    "google cloud services":            "google cloud platform",
-    "azure devops":                     "azure",
-    "microsoft azure":                  "azure",
-    "ms azure":                         "azure",
-
-    # ── Containers / orchestration ─────────────────────────────────────────
-    "k8s":                              "kubernetes",
-    "kube":                             "kubernetes",
-
-    # ── Microservices ──────────────────────────────────────────────────────
-    "micro services":                   "microservices",
-    "micro-services":                   "microservices",
-    "microservice":                     "microservices",
-    "micro service":                    "microservices",
-    "micro service architecture":       "microservices",
-    "microservices architecture":       "microservices",
-
-    # ── Event-driven ───────────────────────────────────────────────────────
-    "event driven architecture":        "event-driven architecture",
-    "event-driven arch":                "event-driven architecture",
-    "eda":                              "event-driven architecture",
-
-    # ── Messaging ──────────────────────────────────────────────────────────
-    "apache kafka":                     "kafka",
-    "kafka connect":                    "kafka",
-    "kafka topic":                      "kafka",
-    "kafka sink connector":             "kafka",
-    "kafka streams":                    "kafka",
-    "rabbit mq":                        "rabbitmq",
-    "rabbit-mq":                        "rabbitmq",
-
-    # ── CI/CD ──────────────────────────────────────────────────────────────
-    "ci/cd":                            "cicd",
-    "ci cd":                            "cicd",
-    "gitlab cicd":                      "cicd",
-    "gitlab ci/cd":                     "cicd",
-    "github actions":                   "cicd",
-    "ci/cd pipelines":                  "cicd",
-    "continuous integration":           "cicd",
-    "continuous deployment":            "cicd",
-    "continuous delivery":              "cicd",
-
-    # ── Databases ──────────────────────────────────────────────────────────
-    "mongo":                            "mongodb",
-    "postgres":                         "postgresql",
-    "postgres sql":                     "postgresql",
-    "psql":                             "postgresql",
-    "big query":                        "bigquery",
-    "ms sql":                           "mssql",
-    "sql server":                       "mssql",
-    "microsoft sql server":             "mssql",
-    "dynamo db":                        "dynamodb",
-    "dynamo":                           "dynamodb",
-    "elastic search":                   "elasticsearch",
-    "open search":                      "opensearch",
-
-    # ── ML libs ────────────────────────────────────────────────────────────
-    "tf":                               "tensorflow",
-    "sklearn":                          "scikit-learn",
-    "scikit learn":                     "scikit-learn",
-    "sci-kit learn":                    "scikit-learn",
-    "hugging face":                     "huggingface",
-    "huggingface transformers":         "huggingface",
-
-    # ── Node ───────────────────────────────────────────────────────────────
-    "node":                             "node.js",
-    "nodejs":                           "node.js",
-
-    # ── Frontend ───────────────────────────────────────────────────────────
-    "react.js":                         "react",
-    "reactjs":                          "react",
-    "react native":                     "react native",
-    "vue.js":                           "vue",
-    "vuejs":                            "vue",
-    "angular.js":                       "angular",
-    "angularjs":                        "angular",
-    "next.js":                          "next.js",
-    "nextjs":                           "next.js",
-    "nuxt.js":                          "nuxt.js",
-    "nuxtjs":                           "nuxt.js",
-
-    # ── REST ───────────────────────────────────────────────────────────────
-    "rest api":                         "rest apis",
-    "rest":                             "rest apis",
-    "restful":                          "rest apis",
-    "restful web services":             "rest apis",
-    "restful apis":                     "rest apis",
-    "restful api":                      "rest apis",
-    "rest services":                    "rest apis",
-
-    # ── Security ───────────────────────────────────────────────────────────
-    "spring security":                  "security",
-    "application security":             "security",
-    "cyber security":                   "cybersecurity",
-    "information security":             "cybersecurity",
-    "infosec":                          "cybersecurity",
-
-    # ── Monitoring ─────────────────────────────────────────────────────────
-    "cloud watch":                      "cloudwatch",
-    "aws cloudwatch":                   "cloudwatch",
-
-    # ── OOP ────────────────────────────────────────────────────────────────
-    "oop":                              "object oriented programming",
-    "object oriented":                  "object oriented programming",
-    "oops":                             "object oriented programming",
-
-    # ── Spring ─────────────────────────────────────────────────────────────
-    "spring boot":                      "spring boot",
-    "springboot":                       "spring boot",
-    "jpa":                              "jpa",
-    "junit":                            "unit testing",
-    "junit testing":                    "unit testing",
-    "junit5":                           "unit testing",
-
-    # ── Data engineering ───────────────────────────────────────────────────
-    "apache spark":                     "spark",
-    "pyspark":                          "spark",
-    "apache airflow":                   "airflow",
-    "apache flink":                     "flink",
-    "apache hive":                      "hive",
-    "apache hadoop":                    "hadoop",
-    "data pipeline":                    "data pipelines",
-    "etl pipeline":                     "etl",
-    "extract transform load":           "etl",
-
-    # ── Mobile ─────────────────────────────────────────────────────────────
-    "ios development":                  "ios",
-    "android development":              "android",
-    "flutter development":              "flutter",
-    "react-native":                     "react native",
-
-    # ── DevOps / Infra ─────────────────────────────────────────────────────
-    "infrastructure as code":           "iac",
-    "infra as code":                    "iac",
-    "terraform iac":                    "terraform",
-    "ansible automation":               "ansible",
-
-    # ── Version control ────────────────────────────────────────────────────
-    "github":                           "git",
-    "gitlab":                           "git",
-    "bitbucket":                        "git",
-    "source control":                   "git",
-    "version control":                  "git",
-
-    # ── Finance / Accounting ───────────────────────────────────────────────
-    "p&l":                              "profit and loss",
-    "pl management":                    "profit and loss",
-    "profit & loss":                    "profit and loss",
-    "p&l management":                   "profit and loss",
-    "p&l ownership":                    "profit and loss",
-    "p&l reporting":                    "profit and loss",
-    "profit loss":                      "profit and loss",
-    "fp&a":                             "financial planning and analysis",
-    "financial planning & analysis":    "financial planning and analysis",
-    "gaap":                             "accounting standards",
-    "ifrs":                             "accounting standards",
-    "accounts receivable":              "ar/ap",
-    "accounts payable":                 "ar/ap",
-    "kpis":                             "kpi management",
-    "kpi":                              "kpi management",
-    "roi analysis":                     "roi",
-    "return on investment":             "roi",
-    "financial modelling":              "financial modeling",
-    "variance analysis":                "financial analysis",
-    "management reporting":             "financial reporting",
-    "mis reporting":                    "financial reporting",
-    "board reporting":                  "financial reporting",
-    "management accounts":              "financial reporting",
-    "financial statements":             "financial reporting",
-    "cash flow":                        "financial management",
-    "cash flow management":             "financial management",
-    "working capital":                  "financial management",
-    "treasury":                         "financial management",
-    "cost analysis":                    "financial analysis",
-    "cost management":                  "financial analysis",
-    "capex":                            "financial planning and analysis",
-    "opex":                             "financial planning and analysis",
-    "budget vs actuals":                "budgeting",
-    "annual budgeting":                 "budgeting",
-    "quarterly forecasting":            "forecasting",
-    "balance sheet":                    "accounting",
-    "income statement":                 "accounting",
-    "bookkeeping":                      "accounting",
-    "accounts":                         "accounting",
-    "tally":                            "accounting software",
-    "quickbooks":                       "accounting software",
-    "zoho books":                       "accounting software",
-    "xero":                             "accounting software",
-    "sage":                             "accounting software",
-    "sap fico":                         "sap",
-    "sap fi":                           "sap",
-    "sap co":                           "sap",
-    "sap s/4hana":                      "sap",
-    "tax compliance":                   "compliance",
-    "gst":                              "tax compliance",
-    "tds":                              "tax compliance",
-    "statutory compliance":             "compliance",
-
-    # ── HR / People ────────────────────────────────────────────────────────
-    "talent acquisition":               "recruitment",
-    "talent management":                "talent development",
-    "performance management":           "performance reviews",
-    "performance appraisal":            "performance reviews",
-    "appraisal":                        "performance reviews",
-    "goal setting":                     "performance management",
-    "okrs":                             "performance management",
-    "kras":                             "performance management",
-    "360 feedback":                     "performance management",
-    "360-degree feedback":              "performance management",
-    "hris":                             "hr information systems",
-    "human resource information system": "hr information systems",
-    "workday":                          "hr information systems",
-    "sap successfactors":               "hr information systems",
-    "successfactors":                   "hr information systems",
-    "zoho people":                      "hr information systems",
-    "bamboohr":                         "hr information systems",
-    "darwinbox":                        "hr information systems",
-    "greythr":                          "hr information systems",
-    "keka":                             "hr information systems",
-    "peoplesoft":                       "hr information systems",
-    "oracle hcm":                       "hr information systems",
-    "dei":                              "diversity and inclusion",
-    "diversity & inclusion":            "diversity and inclusion",
-    "d&i":                              "diversity and inclusion",
-    "equity and inclusion":             "diversity and inclusion",
-    "l&d":                              "learning and development",
-    "learning & development":           "learning and development",
-    "training and development":         "learning and development",
-    "training & development":           "learning and development",
-    "onboarding":                       "employee onboarding",
-    "induction":                        "employee onboarding",
-    "joining formalities":              "employee onboarding",
-    "new hire orientation":             "employee onboarding",
-    "employee engagement":              "employee engagement",
-    "culture building":                 "employee engagement",
-    "employer branding":                "employee engagement",
-    "esat":                             "employee engagement",
-    "pulse surveys":                    "employee engagement",
-    "stay interviews":                  "employee engagement",
-    "workforce planning":               "workforce planning",
-    "headcount planning":               "workforce planning",
-    "manpower planning":                "workforce planning",
-    "succession planning":              "succession planning",
-    "compensation & benefits":          "compensation and benefits",
-    "comp & ben":                       "compensation and benefits",
-    "ctc structuring":                  "compensation and benefits",
-    "salary benchmarking":              "compensation and benefits",
-    "payroll":                          "payroll management",
-    "payroll processing":               "payroll management",
-    "payroll coordination":             "payroll management",
-    "conflict resolution":              "employee relations",
-    "employee relations":               "employee relations",
-    "exit interviews":                  "offboarding",
-    "attrition":                        "retention",
-    "employee attrition":               "retention",
-    "employee retention":               "retention",
-    "talent pipeline":                  "recruitment",
-    "sourcing":                         "recruitment",
-    "screening":                        "recruitment",
-    "talent sourcing":                  "recruitment",
-    "background verification":          "recruitment",
-    "bgv":                              "recruitment",
-    "offer management":                 "recruitment",
-    "full cycle recruiting":            "recruitment",
-    "full-cycle recruiting":            "recruitment",
-    "mass hiring":                      "recruitment",
-    "bulk hiring":                      "recruitment",
-    "campus hiring":                    "recruitment",
-    "lateral hiring":                   "recruitment",
-    "headhunting":                      "recruitment",
-    "naukri":                           "recruitment",
-    "naukri rms":                       "recruitment",
-    "iimjobs":                          "recruitment",
-    "linkedin recruiter":               "recruitment",
-    "ats":                              "applicant tracking system",
-    "applicant tracking":               "applicant tracking system",
-    "employee lifecycle":               "hr operations",
-    "hr policies":                      "hr operations",
-    "policy implementation":            "hr operations",
-    "hr policy":                        "hr operations",
-    "employee handbook":                "hr operations",
-    "hr operations":                    "hr operations",
-    "hrbp":                             "hr business partner",
-    "hr business partnering":           "hr business partner",
-    "strategic hr":                     "hr strategies",
-    "hr strategy":                      "hr strategies",
-    "hr transformation":                "hr strategies",
-    "people analytics":                 "hr analytics",
-    "workforce analytics":              "hr analytics",
-    "hr dashboard":                     "hr analytics",
-    "hr reporting":                     "hr analytics",
-    "hr metrics":                       "hr analytics",
-    "organizational development":       "change management",
-    "organisational development":       "change management",
-    "od":                               "change management",
-    "shrm":                             "hr certification",
-    "shrm-scp":                         "hr certification",
-    "shrm-cp":                          "hr certification",
-    "cipd":                             "hr certification",
-    "phr":                              "hr certification",
-    "sphr":                             "hr certification",
-    "chrp":                             "hr certification",
-    "prosci":                           "change management certification",
-    "change management certification":  "change management certification",
-
-    # ── Sales / Marketing ──────────────────────────────────────────────────
-    "b2b sales":                        "b2b",
-    "b2c sales":                        "b2c",
-    "crm tools":                        "crm",
-    "salesforce crm":                   "salesforce",
-    "hubspot":                          "crm",
-    "hubspot crm":                      "crm",
-    "zoho crm":                         "crm",
-    "ms dynamics":                      "crm",
-    "microsoft dynamics":               "crm",
-    "dynamics 365":                     "crm",
-    "go-to-market":                     "gtm strategy",
-    "go to market":                     "gtm strategy",
-    "gtm":                              "gtm strategy",
-    "demand generation":                "demand gen",
-    "lead generation":                  "demand gen",
-    "lead nurturing":                   "crm",
-    "pipeline management":              "sales",
-    "quota attainment":                 "sales",
-    "revenue generation":               "sales",
-    "cold calling":                     "sales",
-    "prospecting":                      "sales",
-    "upselling":                        "account management",
-    "cross-selling":                    "account management",
-    "key account management":           "account management",
-    "client retention":                 "account management",
-    "seo/sem":                          "seo",
-    "search engine optimisation":       "seo",
-    "search engine optimization":       "seo",
-    "google ads":                       "paid advertising",
-    "facebook ads":                     "paid advertising",
-    "meta ads":                         "paid advertising",
-    "ppc":                              "paid advertising",
-    "pay per click":                    "paid advertising",
-    "paid media":                       "paid advertising",
-    "google analytics":                 "marketing analytics",
-    "account based marketing":          "abm",
-    "content strategy":                 "content marketing",
-    "content creation":                 "content marketing",
-    "copywriting":                      "content marketing",
-    "blog writing":                     "content marketing",
-    "brand management":                 "brand strategy",
-    "social media marketing":           "social media",
-    "instagram marketing":              "social media",
-    "linkedin marketing":               "social media",
-    "email marketing":                  "email campaigns",
-    "market research":                  "marketing",
-    "competitive analysis":             "marketing",
-    "product marketing":                "marketing",
-
-    # ── Operations / Supply Chain ──────────────────────────────────────────
-    "supply chain management":          "supply chain",
-    "s&op":                             "sales and operations planning",
-    "sales & operations planning":      "sales and operations planning",
-    "lean manufacturing":               "lean",
-    "lean methodology":                 "lean",
-    "kaizen":                           "lean",
-    "5s":                               "lean",
-    "value stream mapping":             "lean",
-    "six sigma":                        "six sigma",
-    "6 sigma":                          "six sigma",
-    "lean six sigma":                   "six sigma",
-    "continuous improvement":           "process improvement",
-    "process mapping":                  "process improvement",
-    "sop creation":                     "process improvement",
-    "standard operating procedures":    "process improvement",
-    "sops":                             "process improvement",
-    "bpm":                              "process improvement",
-    "business process management":      "process improvement",
-    "root cause analysis":              "process improvement",
-    "rca":                              "process improvement",
-    "ci":                               "process improvement",
-    "erp systems":                      "erp",
-    "sap erp":                          "sap",
-    "oracle erp":                       "erp",
-    "inventory management":             "inventory management",
-    "vendor management":                "vendor management",
-    "vendor negotiation":               "vendor management",
-    "supplier management":              "vendor management",
-    "contract manufacturing":           "vendor management",
-    "procurement":                      "procurement",
-    "category management":              "procurement",
-    "logistics":                        "logistics",
-    "warehouse management":             "logistics",
-    "fleet management":                 "logistics",
-    "last mile delivery":               "logistics",
-    "3pl":                              "logistics",
-    "demand planning":                  "supply chain",
-    "capacity planning":                "supply chain",
-
-    # ── Legal / Compliance ─────────────────────────────────────────────────
-    "regulatory compliance":            "compliance",
-    "corporate governance":             "compliance",
-    "sebi compliance":                  "compliance",
-    "rbi compliance":                   "compliance",
-    "iso 27001":                        "compliance",
-    "sox compliance":                   "compliance",
-    "sarbanes oxley":                   "compliance",
-    "gdpr":                             "data privacy",
-    "hipaa":                            "data privacy",
-    "ccpa":                             "data privacy",
-    "data protection":                  "data privacy",
-    "privacy policy":                   "data privacy",
-    "pci dss":                          "data privacy",
-    "contract management":              "contracts",
-    "contract negotiation":             "contracts",
-    "contract drafting":                "contracts",
-    "contract review":                  "contracts",
-    "legal drafting":                   "contracts",
-    "mou":                              "contracts",
-    "nda":                              "contracts",
-    "term sheet":                       "contracts",
-    "due diligence":                    "due diligence",
-    "risk management":                  "risk",
-    "enterprise risk":                  "risk",
-    "internal audit":                   "audit",
-    "internal controls":                "audit",
-    "sox":                              "compliance",
-    "legal research":                   "legal",
-    "litigation support":               "legal",
-    "intellectual property":            "legal",
-
-    # ── Soft / Leadership ──────────────────────────────────────────────────
-    "cross functional":                 "cross-functional collaboration",
-    "cross-functional teams":           "cross-functional collaboration",
-    "stakeholder mgmt":                 "stakeholder management",
-    "c-suite":                          "executive communication",
-    "c suite":                          "executive communication",
-    "executive stakeholders":           "executive communication",
-    "people management":                "team management",
-    "people leadership":                "team management",
-    "line management":                  "team management",
-    "change management":                "change management",
-    "organisational change":            "change management",
-    "organizational change":            "change management",
-    "strategic thinking":               "strategic planning",
-    "strategy development":             "strategic planning",
-    "business development":             "business development",
-    "bd":                               "business development",
-    "account management":               "account management",
-    "client management":                "account management",
-    "relationship management":          "relationship management",
-    "project management":               "project management",
-    "programme management":             "program management",
-    "program management":               "program management",
-    "pmo":                              "program management",
-    "agile methodology":                "agile",
-    "scrum methodology":                "scrum",
-    "prince2":                          "project management",
-    "pmp":                              "project management",
-    "presentation skills":              "communication",
-    "public speaking":                  "communication",
-    "written communication":            "communication",
-    "verbal communication":             "communication",
-    "active listening":                 "interpersonal skills",
-    "emotional intelligence":           "interpersonal skills",
-    "empathy":                          "interpersonal skills",
-    "team player":                      "collaboration",
-    "team work":                        "collaboration",
-    "teamwork":                         "collaboration",
-    "multi-tasking":                    "time management",
-    "multitasking":                     "time management",
-    "deadline management":              "time management",
-    "analytical thinking":              "analytical skills",
-    "data driven":                      "analytical skills",
-    "critical thinking":                "analytical skills",
-    "problem solving":                  "analytical skills",
-    "decision making":                  "analytical skills",
-    "mentoring":                        "coaching",
-    "mentorship":                       "coaching",
-    "training delivery":                "learning and development",
-    "facilitation":                     "learning and development",
-
-    # ── Productivity / Office Tools ────────────────────────────────────────
-    "ms office":                        "microsoft office",
-    "ms excel":                         "excel",
-    "microsoft excel":                  "excel",
-    "advanced excel":                   "excel",
-    "pivot tables":                     "excel",
-    "vlookup":                          "excel",
-    "ms powerpoint":                    "powerpoint",
-    "microsoft powerpoint":             "powerpoint",
-    "google workspace":                 "productivity tools",
-    "gsuite":                           "productivity tools",
-    "g suite":                          "productivity tools",
-    "ms word":                          "microsoft office",
-    "microsoft word":                   "microsoft office",
-
-    # ── Analytics / BI Tools ───────────────────────────────────────────────
-    "power bi":                         "data visualization",
-    "tableau":                          "data visualization",
-    "looker":                           "data visualization",
-    "qlik":                             "data visualization",
-    "metabase":                         "data visualization",
-    "data studio":                      "data visualization",
-    "google data studio":               "data visualization",
-}
-
-SKILL_ALIASES.update({
-
-    # ───────────────────────────────────────
-    # CLOUD SECURITY / DEVSECOPS
-    # ───────────────────────────────────────
-    "prisma": "prisma cloud",
-    "prisma cloud security": "prisma cloud",
-    "azure defender": "defender for cloud",
-    "microsoft defender for cloud": "defender for cloud",
-    "defender": "defender for cloud",
-
-    "cve": "vulnerability management",
-    "cves": "vulnerability management",
-    "vulnerability scanning": "vulnerability management",
-    "security scanning": "vulnerability management",
-    "container scanning": "vulnerability management",
-    "image scanning": "vulnerability management",
-
-    "runtime protection": "container security",
-    "kubernetes security": "container security",
-    "docker security": "container security",
-
-    "cspm": "cloud security",
-    "cloud security posture management": "cloud security",
-
-    "nist framework": "security frameworks",
-    "cis": "cis benchmarks",
-    "iso security": "security frameworks",
-
-    # ───────────────────────────────────────
-    # SOFT SKILLS NORMALIZATION
-    # ───────────────────────────────────────
-    "stakeholder communication": "communication",
-    "executive communication": "communication",
-    "verbal skills": "communication",
-    "written skills": "communication",
-
-    "relationship building": "interpersonal skills",
-    "people skills": "interpersonal skills",
-    "soft skills": "interpersonal skills",
-
-    "problem solving skills": "analytical skills",
-    "analytical thinking skills": "analytical skills",
-    "data analysis": "analytical skills",
-    "data analytics": "analytical skills",
-
-    # ───────────────────────────────────────
-    # AGILE / PROJECT / DELIVERY
-    # ───────────────────────────────────────
-    "scrum master": "scrum",
-    "agile development": "agile",
-    "agile framework": "agile",
-
-    "jira tool": "jira",
-    "atlassian jira": "jira",
-    "confluence tool": "confluence",
-
-    # ───────────────────────────────────────
-    # HR / BUSINESS EDGE CASES
-    # ───────────────────────────────────────
-    "people management": "team management",
-    "team leadership": "team management",
-
-    "employee lifecycle management": "employee lifecycle",
-    "exit process": "offboarding",
-
-    "employee satisfaction": "employee engagement",
-    "employee experience": "employee engagement",
-
-    "hrbp role": "hr business partner",
-
-    # ───────────────────────────────────────
-    # CLOUD EDGE CASES
-    # ───────────────────────────────────────
-    "multi cloud": "cloud",
-    "multi-cloud": "cloud",
-    "hybrid cloud": "cloud",
-
-    "aws ec2": "aws",
-    "aws s3": "aws",
-    "aws rds": "aws",
-
-    "azure aks": "kubernetes",
-    "azure kubernetes service": "kubernetes",
-
-    # ───────────────────────────────────────
-    # DATA / ANALYTICS EDGE CASES
-    # ───────────────────────────────────────
-    "dashboarding": "data visualization",
-    "bi tools": "data visualization",
-
-})
-
-SKILL_ALIASES.update({
-
-    # ───────────────────────────────────────
-    # TECH LEAD / ARCHITECTURE
-    # ───────────────────────────────────────
-    "tech lead": "technical leadership",
-    "technical lead": "technical leadership",
-    "engineering lead": "technical leadership",
-    "team lead": "technical leadership",
-
-    "system architecture": "system design",
-    "solution architecture": "system design",
-    "application architecture": "system design",
-    "architecture design": "system design",
-
-    "scalable systems": "system design",
-    "high availability": "system design",
-    "distributed architecture": "distributed systems",
-
-    "code review": "software development",
-    "design reviews": "system design",
-
-    # ───────────────────────────────────────
-    # DATA / AI / ANALYTICS (ADVANCED)
-    # ───────────────────────────────────────
-    "machine learning model": "machine learning",
-    "ml models": "machine learning",
-    "model building": "machine learning",
-
-    "feature engineering": "machine learning",
-    "model deployment": "mlops",
-    "ml pipeline": "mlops",
-    "mlops pipeline": "mlops",
-
-    "deep learning models": "deep learning",
-    "neural networks": "deep learning",
-
-    "data science": "data analysis",
-    "data scientist": "data analysis",
-
-    "bigquery": "data warehousing",
-    "snowflake db": "data warehousing",
-
-    # ───────────────────────────────────────
-    # CYBERSECURITY (ADVANCED)
-    # ───────────────────────────────────────
-    "penetration testing": "security testing",
-    "pen testing": "security testing",
-    "ethical hacking": "security testing",
-
-    "iam": "identity management",
-    "identity access management": "identity management",
-
-    "zero trust architecture": "security best practices",
-
-    "soc": "security operations",
-    "security operations center": "security operations",
-
-    "siem": "security monitoring",
-    "security monitoring tools": "security monitoring",
-
-    # ───────────────────────────────────────
-    # FINANCE (ADVANCED / EDGE CASES)
-    # ───────────────────────────────────────
-    "financial planning": "financial planning and analysis",
-    "fpna": "financial planning and analysis",
-
-    "business finance": "financial analysis",
-    "corporate finance": "financial analysis",
-
-    "cost optimization": "financial analysis",
-    "profitability analysis": "financial analysis",
-
-    "variance reporting": "financial analysis",
-
-    "audit compliance": "audit",
-    "internal controls testing": "audit",
-
-    "working capital management": "financial management",
-
-    # ───────────────────────────────────────
-    # PRODUCT / BUSINESS / CONSULTING
-    # ───────────────────────────────────────
-    "product management": "product strategy",
-    "product strategy": "product strategy",
-    "roadmap planning": "product strategy",
-    "product roadmap": "product strategy",
-
-    "user research": "product strategy",
-    "customer research": "product strategy",
-
-    "stakeholder alignment": "stakeholder management",
-
-    "business strategy": "strategic planning",
-    "corporate strategy": "strategic planning",
-
-    "management consulting": "business consulting",
-    "consulting": "business consulting",
-
-    # ───────────────────────────────────────
-    # PROJECT / DELIVERY (ADVANCED)
-    # ───────────────────────────────────────
-    "delivery management": "project management",
-    "project delivery": "project management",
-
-    "risk mitigation": "risk management",
-    "risk assessment": "risk management",
-
-    "resource planning": "project management",
-
-    # ───────────────────────────────────────
-    # OPERATIONS (ADVANCED)
-    # ───────────────────────────────────────
-    "operations management": "operations",
-    "business operations": "operations",
-
-    "process optimization": "process improvement",
-
-    "lean operations": "lean",
-
-    # ───────────────────────────────────────
-    # GENERAL BUSINESS SKILLS (IMPORTANT)
-    # ───────────────────────────────────────
-    "decision making skills": "analytical skills",
-    "problem solving ability": "analytical skills",
-
-    "organizational skills": "time management",
-    "planning skills": "time management",
-
-    "work management": "project management",
-
-})
-
-
-def normalize_skill(skill: str) -> str:
-    """Lowercase, strip noise, apply alias map."""
+# ---------------------------------------------------------------------------
+# Timeout helper
+# ---------------------------------------------------------------------------
+
+async def _with_timeout(coro, timeout_seconds: float, fallback, label: str = ""):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] '{label}' exceeded {timeout_seconds}s — using fallback")
+        return fallback
+    except Exception as e:
+        print(f"[ERROR] '{label}' raised {e} — using fallback")
+        return fallback
+
+
+# ---------------------------------------------------------------------------
+# Minimal canonical normalisation
+# ---------------------------------------------------------------------------
+
+def _basic_normalize(skill: str) -> str:
     skill = skill.lower().strip()
-    skill = re.sub(r'\(.*?\)', '', skill)                    # remove (parentheticals)
-    skill = skill.replace("programming language", "").strip()
-    skill = skill.replace("programming", "").strip()
-    # FIX: preserve +, #, ., /, - which are meaningful in skill names (c++, c#, node.js)
-    skill = re.sub(r'[^a-z0-9+#\./\- &]', ' ', skill)       # keep & for p&l, fp&a etc.
+    skill = re.sub(r'\(.*?\)', '', skill)
     skill = re.sub(r'\s+', ' ', skill).strip()
-    return SKILL_ALIASES.get(skill, skill)
-
-
-def normalize_skills(skill_list) -> set[str]:
-    return {normalize_skill(s) for s in skill_list if s and str(s).strip()}
+    return skill
 
 
 def _word_boundary_re(skill: str) -> re.Pattern:
-    """
-    Word boundary regex that correctly handles special chars in skill names
-    like c#, c++, node.js — these chars are not word chars so \\b fails on them.
-    """
     escaped = re.escape(skill)
     return re.compile(
         r'(?<![a-z0-9])' + escaped + r'(?![a-z0-9])',
@@ -918,785 +159,164 @@ def _word_boundary_re(skill: str) -> re.Pattern:
 
 
 def _exact_overlap(skill_a: str, skill_b: str) -> bool:
-    """
-    Strict word-boundary string overlap.
-    Prevents Java ↔ JavaScript false positives.
-    Also handles skills with special chars like c#, c++, node.js.
-    """
-    a = normalize_skill(skill_a)
-    b = normalize_skill(skill_b)
+    a = _basic_normalize(skill_a)
+    b = _basic_normalize(skill_b)
     if a == b:
         return True
     shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    # Only match if shorter is at least 2 chars to avoid single-letter false positives
     if len(shorter) < 2:
         return False
     try:
         return bool(_word_boundary_re(shorter).search(longer))
     except re.error:
-        # If regex fails due to special chars, fall back to plain substring
         return shorter in longer
 
 
 # =============================================================================
-# LAYER 2 — Implied-skill map
-# Broad JD term → set of specific skills that satisfy it
+# COMBINED Step 1+2+3+normalisation — single LLM call
 # =============================================================================
 
-IMPLIED_SKILL_MAP: dict[str, set[str]] = {
-    # ── Databases ─────────────────────────────────────────────────────────
-    "nosql":                    {"mongodb", "cassandra", "redis", "dynamodb",
-                                 "couchdb", "firebase", "bigquery", "elasticsearch"},
-    "sql":                      {"postgresql", "mysql", "sqlite", "mssql",
-                                 "oracle", "bigquery"},
-    "database":                 {"postgresql", "mysql", "mongodb", "sqlite",
-                                 "mssql", "bigquery", "redis", "dynamodb"},
-    "relational database":      {"postgresql", "mysql", "sqlite", "mssql", "oracle"},
-
-    # ── Cloud ─────────────────────────────────────────────────────────────
-    "cloud":                    {"aws", "azure", "google cloud platform"},
-    "cloud deployment":         {"aws", "kubernetes", "docker"},
-    "cloud platforms":          {"aws", "azure", "google cloud platform"},
-    "cloud services":           {"aws", "azure", "google cloud platform"},
-
-    # ── Containers ────────────────────────────────────────────────────────
-    "containerization":         {"docker", "kubernetes", "podman"},
-    "containerized environments": {"docker", "kubernetes"},
-    "containers":               {"docker", "kubernetes"},
-
-    # ── Microservices / architecture ──────────────────────────────────────
-    "microservices":            {"spring boot", "fastapi", "flask",
-                                 "express", "node.js"},
-    "microservices architecture": {"microservices", "spring boot",
-                                   "fastapi", "flask"},
-    "distributed systems":      {"microservices", "kafka",
-                                 "event-driven architecture"},
-    "service oriented architecture": {"microservices", "rest apis", "spring boot"},
-    "soa":                      {"microservices", "rest apis"},
-
-    # ── Messaging / event-driven ──────────────────────────────────────────
-    "messaging systems":        {"kafka", "activemq", "rabbitmq",
-                                 "sqs", "kinesis", "pubsub"},
-    "message queues":           {"kafka", "activemq", "rabbitmq", "sqs"},
-    "event-driven architecture": {"kafka", "activemq", "kinesis",
-                                  "rabbitmq", "event-driven architecture"},
-    "event driven":             {"kafka", "activemq", "kinesis",
-                                 "event-driven architecture"},
-
-    # ── CI/CD ─────────────────────────────────────────────────────────────
-    "cicd":                     {"jenkins", "gitlab cicd", "github actions",
-                                 "circleci", "travis ci", "teamcity"},
-    "ci/cd pipelines":          {"jenkins", "cicd", "github actions"},
-    "devops":                   {"jenkins", "cicd", "docker", "kubernetes",
-                                 "terraform", "ansible"},
-    "build automation":         {"jenkins", "cicd", "maven", "gradle"},
-
-    # ── REST / APIs ───────────────────────────────────────────────────────
-    "rest apis":                {"spring boot", "fastapi", "flask",
-                                 "express", "node.js"},
-    "api development":          {"rest apis", "fastapi", "flask", "spring boot"},
-    "api design":               {"rest apis", "graphql", "openapi"},
-    "backend systems":          {"spring boot", "fastapi", "flask",
-                                 "node.js", "express"},
-    "backend development":      {"spring boot", "fastapi", "flask",
-                                 "node.js", "express", "django"},
-    "web services":             {"rest apis", "graphql", "spring boot", "fastapi"},
-
-    # ── Auth / Security ───────────────────────────────────────────────────
-    "authentication":           {"oauth2", "pkce", "jwt", "saml",
-                                 "spring security", "openid"},
-    "authorization":            {"oauth2", "jwt", "rbac", "saml"},
-    "security":                 {"spring security", "oauth2", "jwt",
-                                 "pkce", "saml"},
-    "identity management":      {"oauth2", "saml", "openid", "ldap"},
-
-    # ── Monitoring / observability ────────────────────────────────────────
-    "monitoring":               {"prometheus", "grafana", "cloudwatch",
-                                 "splunk", "datadog", "newrelic"},
-    "observability":            {"prometheus", "grafana", "cloudwatch",
-                                 "splunk", "datadog"},
-    "application monitoring":   {"prometheus", "grafana", "cloudwatch",
-                                 "splunk", "datadog"},
-    "logging":                  {"elk stack", "splunk", "cloudwatch",
-                                 "datadog", "loki"},
-
-    # ── Version control ───────────────────────────────────────────────────
-    "version control":          {"git"},
-    "source control":           {"git"},
-
-    # ── Language implications ─────────────────────────────────────────────
-    "javascript":               {"typescript"},
-    "jvm":                      {"java", "kotlin", "scala"},
-
-    # ── System design ─────────────────────────────────────────────────────
-    "system design":            {"system design", "distributed systems",
-                                 "microservices"},
-    "software architecture":    {"system design", "microservices",
-                                 "distributed systems"},
-    "design patterns":          {"system design", "object oriented programming"},
-
-    # ── LLM / AI frameworks ───────────────────────────────────────────────
-    "llm frameworks":           {"langchain", "llamaindex"},
-    "llm apis":                 {"openai", "anthropic"},
-    "ai frameworks":            {"langchain", "llamaindex", "huggingface",
-                                 "tensorflow", "pytorch"},
-    "generative ai":            {"large language models", "langchain",
-                                 "openai", "huggingface"},
-
-    # ── Testing ───────────────────────────────────────────────────────────
-    "testing":                  {"unit testing", "junit", "pytest",
-                                 "jest", "mocha", "selenium"},
-    "test automation":          {"selenium", "cypress", "pytest",
-                                 "jest", "unit testing"},
-    "qa":                       {"unit testing", "selenium", "cypress",
-                                 "test automation", "pytest"},
-
-    # ── Data engineering ──────────────────────────────────────────────────
-    "big data":                 {"spark", "hadoop", "hive", "bigquery",
-                                 "kafka", "flink"},
-    "data pipelines":           {"airflow", "spark", "kafka", "etl",
-                                 "dbt", "flink"},
-    "etl":                      {"spark", "airflow", "talend",
-                                 "informatica", "dbt"},
-    "data warehousing":         {"bigquery", "snowflake", "redshift",
-                                 "databricks"},
-    "data engineering":         {"spark", "airflow", "kafka", "etl",
-                                 "bigquery", "snowflake"},
-
-    # ── Frontend ──────────────────────────────────────────────────────────
-    "frontend development":     {"react", "vue", "angular", "next.js",
-                                 "typescript", "javascript"},
-    "ui development":           {"react", "vue", "angular", "html", "css"},
-    "web development":          {"react", "vue", "angular", "javascript",
-                                 "typescript", "html", "css"},
-
-    # ── Mobile ────────────────────────────────────────────────────────────
-    "mobile development":       {"react native", "flutter", "ios",
-                                 "android", "swift", "kotlin"},
-    "cross platform":           {"react native", "flutter", "xamarin"},
-
-    # ── Infrastructure / IaC ─────────────────────────────────────────────
-    "infrastructure":           {"terraform", "ansible", "kubernetes",
-                                 "docker", "aws"},
-    "iac":                      {"terraform", "ansible", "pulumi",
-                                 "cloudformation"},
-    "configuration management": {"ansible", "chef", "puppet", "terraform"},
-
-    # ── Finance / Accounting ──────────────────────────────────────────────
-    "financial analysis":       {"profit and loss", "financial planning and analysis",
-                                 "budgeting", "forecasting", "roi",
-                                 "financial modeling", "financial reporting"},
-    "financial management":     {"profit and loss", "budgeting", "forecasting",
-                                 "financial planning and analysis", "cash flow management"},
-    "accounting":               {"accounting standards", "ar/ap",
-                                 "financial reporting", "audit",
-                                 "accounting software", "tally", "quickbooks"},
-    "accounting software":      {"tally", "quickbooks", "zoho books",
-                                 "sap", "xero", "sage"},
-    "budgeting":                {"financial planning and analysis",
-                                 "profit and loss", "forecasting"},
-    "forecasting":              {"financial planning and analysis",
-                                 "profit and loss", "budgeting"},
-    "financial reporting":      {"mis reporting", "financial statements",
-                                 "management accounts", "board reporting"},
-    "tax":                      {"tax compliance", "gst", "tds", "compliance"},
-    "statutory compliance":     {"compliance", "tax compliance", "labor laws"},
-
-    # ── HR / People ───────────────────────────────────────────────────────
-    "hr":                       {"recruitment", "talent development",
-                                 "employee onboarding", "learning and development",
-                                 "diversity and inclusion", "performance reviews",
-                                 "hr information systems", "hr operations",
-                                 "employee engagement", "hr analytics"},
-    "human resources":          {"recruitment", "talent development",
-                                 "employee onboarding", "learning and development",
-                                 "diversity and inclusion", "hr operations",
-                                 "employee engagement", "performance reviews"},
-    "hr information systems":   {"workday", "sap successfactors", "successfactors",
-                                 "zoho people", "bamboohr", "darwinbox",
-                                 "greythr", "keka", "peoplesoft", "oracle hcm"},
-    "hris":                     {"workday", "sap successfactors", "successfactors",
-                                 "zoho people", "bamboohr", "darwinbox",
-                                 "greythr", "keka", "peoplesoft", "oracle hcm"},
-    "hr tools":                 {"workday", "sap successfactors", "successfactors",
-                                 "zoho people", "bamboohr", "darwinbox",
-                                 "greythr", "keka"},
-    "people management":        {"team management", "performance reviews",
-                                 "talent development", "employee engagement",
-                                 "coaching"},
-    "talent":                   {"recruitment", "talent development",
-                                 "succession planning", "workforce planning"},
-    "retention":                {"employee engagement", "talent development",
-                                 "employee onboarding", "recruitment",
-                                 "compensation and benefits"},
-    "employee retention":       {"employee engagement", "talent development",
-                                 "compensation and benefits"},
-    "labor laws":               {"compliance", "hr operations",
-                                 "statutory compliance"},
-    "labour laws":              {"compliance", "hr operations",
-                                 "statutory compliance"},
-    "training and development": {"learning and development", "employee onboarding",
-                                 "coaching", "facilitation"},
-    "interpersonal skills":     {"communication", "stakeholder management",
-                                 "relationship management", "collaboration"},
-    "hr strategies":            {"stakeholder management", "strategic planning",
-                                 "hr analytics", "hr operations",
-                                 "change management"},
-    "hr strategy":              {"stakeholder management", "strategic planning",
-                                 "hr analytics", "hr operations"},
-    "offboarding":              {"recruitment", "employee onboarding",
-                                 "hr operations", "employee relations"},
-    "employee lifecycle":       {"recruitment", "employee onboarding",
-                                 "performance reviews", "offboarding",
-                                 "hr operations"},
-    "compliance":               {"labor laws", "hr operations",
-                                 "statutory compliance", "regulatory compliance"},
-    "performance management":   {"performance reviews", "goal setting",
-                                 "appraisal", "okrs", "kpi management"},
-    "employee relations":       {"conflict resolution", "employee engagement",
-                                 "hr operations"},
-    "payroll":                  {"payroll management", "compensation and benefits",
-                                 "hr operations"},
-    "payroll management":       {"compensation and benefits", "hr operations",
-                                 "hr information systems"},
-    "recruitment":              {"talent acquisition", "sourcing", "screening",
-                                 "applicant tracking system"},
-    "hr analytics":             {"hr metrics", "people analytics",
-                                 "workforce analytics", "data visualization",
-                                 "excel"},
-    "hr metrics":               {"hr analytics", "people analytics",
-                                 "data visualization", "excel"},
-    "change management":        {"change management", "stakeholder management",
-                                 "cross-functional collaboration",
-                                 "organizational development"},
-    "organizational restructuring": {"change management", "stakeholder management",
-                                     "strategic planning"},
-
-    # ── Sales / Marketing ─────────────────────────────────────────────────
-    "sales":                    {"b2b", "crm", "salesforce", "account management",
-                                 "pipeline management", "negotiation",
-                                 "business development"},
-    "marketing":                {"gtm strategy", "demand gen", "seo",
-                                 "content marketing", "paid advertising",
-                                 "crm", "brand strategy", "social media"},
-    "digital marketing":        {"seo", "paid advertising", "social media",
-                                 "email campaigns", "demand gen", "crm",
-                                 "marketing analytics"},
-    "growth":                   {"demand gen", "gtm strategy", "seo",
-                                 "paid advertising", "crm"},
-    "crm":                      {"salesforce", "hubspot", "zoho crm",
-                                 "ms dynamics", "dynamics 365"},
-    "data visualization":       {"power bi", "tableau", "looker",
-                                 "data studio", "excel"},
-    "reporting":                {"excel", "data visualization",
-                                 "mis reporting", "hr analytics"},
-    "advanced analytics":       {"data visualization", "power bi", "tableau",
-                                 "sql", "excel"},
-
-    # ── Operations / Supply Chain ─────────────────────────────────────────
-    "operations":               {"process improvement", "supply chain", "erp",
-                                 "six sigma", "lean", "vendor management",
-                                 "procurement"},
-    "supply chain":             {"procurement", "logistics", "inventory management",
-                                 "vendor management", "sales and operations planning"},
-    "process improvement":      {"six sigma", "lean", "process improvement",
-                                 "kaizen", "root cause analysis"},
-    "vendor management":        {"procurement", "supplier management",
-                                 "vendor negotiation"},
-
-    # ── Legal / Compliance ────────────────────────────────────────────────
-    "compliance":               {"data privacy", "risk", "contracts",
-                                 "audit", "regulatory compliance",
-                                 "labor laws", "statutory compliance"},
-    "risk":                     {"risk", "compliance", "audit",
-                                 "due diligence"},
-    "legal":                    {"contracts", "compliance", "due diligence",
-                                 "risk", "legal research"},
-    "contracts":                {"contract drafting", "contract review",
-                                 "contract management", "nda", "mou"},
-
-    # ── Leadership / Soft ─────────────────────────────────────────────────
-    "leadership":               {"team management", "stakeholder management",
-                                 "performance reviews", "strategic planning",
-                                 "executive communication"},
-    "management":               {"team management", "project management",
-                                 "performance reviews", "stakeholder management"},
-    "strategy":                 {"strategic planning", "business development",
-                                 "gtm strategy", "stakeholder management"},
-    "communication":            {"stakeholder management", "executive communication",
-                                 "cross-functional collaboration",
-                                 "presentation skills", "interpersonal skills"},
-    "collaboration":            {"cross-functional collaboration",
-                                 "stakeholder management", "team management"},
-    "project management":       {"agile", "scrum", "program management",
-                                 "stakeholder management", "risk"},
-    "program management":       {"project management", "stakeholder management",
-                                 "strategic planning", "risk"},
-    "business development":     {"b2b", "account management", "negotiation",
-                                 "crm", "relationship management",
-                                 "gtm strategy"},
-    "team management":          {"stakeholder management", "employee engagement",
-                                 "performance reviews", "coaching",
-                                 "people management"},
-    "analytical skills":        {"hr analytics", "financial analysis",
-                                 "data visualization", "excel", "sql"},
-    "microsoft office":         {"excel", "powerpoint", "microsoft office"},
-    "productivity tools":       {"microsoft office", "excel",
-                                 "google workspace", "productivity tools"},
-}
-
-IMPLIED_SKILL_MAP.update({
-
-    # ───────────────────────────────────────
-    # CLOUD SECURITY FIXES
-    # ───────────────────────────────────────
-    "vulnerability management": {
-        "vulnerability scanning", "security scanning",
-        "cve", "cves", "trivy", "hadolint",
-        "defender for cloud", "prisma cloud",
-        "image scanning", "container scanning"
-    },
-
-    "container security": {
-        "kubernetes", "docker", "aks",
-        "runtime protection", "image scanning",
-        "container hardening", "kubernetes security"
-    },
-
-    "workload protection": {
-        "runtime protection", "container security",
-        "kubernetes security", "workload security"
-    },
-
-    "cloud security": {
-        "defender for cloud", "prisma cloud", "cspm",
-        "cloud security posture", "azure security",
-        "aws security", "cloud security posture management"
-    },
-
-    "security best practices": {
-        "secure configuration", "zero trust",
-        "least privilege", "policy enforcement",
-        "network security", "secure architecture"
-    },
-
-    "cloud terminology": {
-        "aws", "azure", "cloud infrastructure",
-        "cloud architecture", "multi-cloud"
-    },
-
-    # ───────────────────────────────────────
-    # SECURITY FRAMEWORKS FIX
-    # ───────────────────────────────────────
-    "security frameworks": {
-        "cis benchmarks", "nist", "iso 27001",
-        "compliance standards"
-    },
-
-    "compliance standards": {
-        "cis benchmarks", "regulatory compliance",
-        "policy enforcement", "security frameworks"
-    },
-
-    "cis benchmarks": {
-        "security frameworks", "compliance standards"
-    },
-
-    "nist": {
-        "security frameworks", "compliance standards"
-    },
-
-    # ───────────────────────────────────────
-    # ITIL / ITSM FIX (CRITICAL)
-    # ───────────────────────────────────────
-    "itil framework": {
-        "incident management", "servicenow",
-        "sla", "ola", "change management",
-        "problem management"
-    },
-
-    "it service management": {
-        "servicenow", "incident management",
-        "change management", "itil"
-    },
-
-    # ───────────────────────────────────────
-    # ROLE ABSTRACTION FIX
-    # ───────────────────────────────────────
-    "cloud developers": {
-        "developers", "devops", "engineering team",
-        "software engineers"
-    },
-
-    "security architects": {
-        "architects", "cloud architects",
-        "solution architects", "security engineers"
-    },
-
-    "cloud architects": {
-        "architects", "solution architects",
-        "infrastructure architects"
-    },
-
-    # ───────────────────────────────────────
-    # METRICS / AUTOMATION
-    # ───────────────────────────────────────
-    "security metrics": {
-        "monitoring", "reporting", "dashboards",
-        "alerts", "log analytics"
-    },
-
-    "automated remediation": {
-        "ci/cd", "pipelines", "automation",
-        "terraform", "infrastructure as code"
-    },
-
-    # ───────────────────────────────────────
-    # AGILE FIX
-    # ───────────────────────────────────────
-    "agile": {
-        "scrum", "devops", "ci/cd",
-        "sprints", "kanban"
-    },
-
-    "scrum": {
-        "agile", "devops", "ci/cd"
-    },
-
-    # ───────────────────────────────────────
-    # HR FIXES
-    # ───────────────────────────────────────
-    "retention": {
-        "employee engagement", "attrition",
-        "employee retention"
-    },
-
-    "employee retention": {
-        "employee engagement", "attrition"
-    },
-
-    "interpersonal skills": {
-        "communication", "stakeholder management",
-        "relationship management", "collaboration"
-    },
-
-    "training and development": {
-        "learning and development",
-        "employee onboarding", "coaching",
-        "facilitation"
-    },
-
-    "hr strategies": {
-        "stakeholder management",
-        "strategic planning",
-        "hr analytics", "hr operations",
-        "change management"
-    },
-
-    "offboarding": {
-        "employee lifecycle", "exit interviews",
-        "hr operations", "employee relations"
-    },
-
-    "hr metrics": {
-        "hr analytics", "people analytics",
-        "reporting", "dashboards"
-    },
-
-    "hr analytics": {
-        "hr metrics", "people analytics",
-        "workforce analytics"
-    },
-
-    "diversity and inclusion": {
-        "dei", "culture", "employee engagement"
-    },
-
-    "labor laws": {
-        "compliance", "hr policies",
-        "statutory compliance"
-    },
-})
-
-IMPLIED_SKILL_MAP.update({
-
-    # ───────────────────────────────────────
-    # SYSTEM DESIGN / ARCHITECTURE (CRITICAL)
-    # ───────────────────────────────────────
-    "scalability": {
-        "distributed systems", "microservices", "load balancing"
-    },
-
-    "high availability": {
-        "distributed systems", "cloud", "failover"
-    },
-
-    "fault tolerance": {
-        "distributed systems", "microservices"
-    },
-
-    "system reliability": {
-        "monitoring", "observability", "logging"
-    },
-
-    "design tradeoffs": {
-        "system design", "architecture"
-    },
-
-    # ───────────────────────────────────────
-    # GEN AI / MLOPS (IMPORTANT)
-    # ───────────────────────────────────────
-    "rag pipelines": {
-        "langchain", "llamaindex", "vector databases",
-        "embeddings", "retrieval"
-    },
-
-    "prompt engineering": {
-        "large language models", "generative ai"
-    },
-
-    "embeddings": {
-        "vector databases", "machine learning"
-    },
-
-    "vector databases": {
-        "pinecone", "faiss", "weaviate"
-    },
-
-    "mlops": {
-        "model deployment", "pipelines", "ci/cd"
-    },
-
-    # ───────────────────────────────────────
-    # PRODUCT / STRATEGY (BIG GAP FIX)
-    # ───────────────────────────────────────
-    "product thinking": {
-        "product strategy", "user research", "customer research"
-    },
-
-    "business impact": {
-        "kpi management", "roi", "metrics"
-    },
-
-    "decision making": {
-        "analytical skills", "problem solving"
-    },
-
-    # ───────────────────────────────────────
-    # SECURITY (ADVANCED FIX)
-    # ───────────────────────────────────────
-    "identity access management": {
-        "oauth2", "saml", "rbac", "iam"
-    },
-
-    "threat modeling": {
-        "security", "risk", "architecture"
-    },
-
-    "zero trust": {
-        "security best practices", "identity management"
-    },
-
-    # ───────────────────────────────────────
-    # SOFT SKILLS (FIX FALSE GAPS)
-    # ───────────────────────────────────────
-    "problem solving": {
-        "analytical skills", "decision making"
-    },
-
-    "critical thinking": {
-        "analytical skills"
-    },
-
-    "decision making skills": {
-        "analytical skills"
-    },
-
-})
-
-IMPLIED_SKILL_MAP.update({
-
-    # ───────────────────────────────────────
-    # ADVANCED ARCHITECTURE / BACKEND
-    # ───────────────────────────────────────
-    "backend engineering": {
-        "backend development", "apis", "microservices", "databases"
-    },
-    "api integration": {
-        "rest apis", "graphql", "web services"
-    },
-    "performance optimization": {
-        "scalability", "system design", "profiling"
-    },
-    "latency optimization": {
-        "performance optimization", "system design"
-    },
-
-    # ───────────────────────────────────────
-    # CLOUD (REAL-WORLD EDGE CASES)
-    # ───────────────────────────────────────
-    "cloud migration": {
-        "aws", "azure", "cloud", "infrastructure"
-    },
-    "multi-cloud architecture": {
-        "aws", "azure", "gcp", "cloud"
-    },
-    "cloud cost optimization": {
-        "cloud", "financial analysis", "aws", "azure"
-    },
-
-    # ───────────────────────────────────────
-    # SECURITY (DEEP EDGE CASES)
-    # ───────────────────────────────────────
-    "application security": {
-        "security", "vulnerability management", "secure coding"
-    },
-    "devsecops": {
-        "ci/cd", "security", "automation"
-    },
-    "security operations": {
-        "incident management", "monitoring", "security"
-    },
-    "threat detection": {
-        "monitoring", "security metrics"
-    },
-
-    # ───────────────────────────────────────
-    # DATA / AI / GENAI EDGE CASES
-    # ───────────────────────────────────────
-    "nlp": {
-        "natural language processing", "machine learning"
-    },
-    "computer vision": {
-        "deep learning", "machine learning"
-    },
-    "data pipelines orchestration": {
-        "airflow", "etl", "data pipelines"
-    },
-    "real-time data processing": {
-        "kafka", "stream processing", "big data"
-    },
-
-    # ───────────────────────────────────────
-    # PRODUCT / BUSINESS EDGE CASES
-    # ───────────────────────────────────────
-    "go to market": {
-        "gtm strategy", "marketing", "sales"
-    },
-    "customer success": {
-        "crm", "stakeholder management", "support"
-    },
-    "user experience": {
-        "ui development", "frontend development"
-    },
-    "a/b testing": {
-        "experimentation", "data analysis"
-    },
-
-    # ───────────────────────────────────────
-    # FINANCE EDGE CASES
-    # ───────────────────────────────────────
-    "financial modeling": {
-        "financial analysis", "excel"
-    },
-    "cash flow": {
-        "financial management", "forecasting"
-    },
-    "cost analysis": {
-        "financial analysis", "budgeting"
-    },
-
-    # ───────────────────────────────────────
-    # HR EDGE CASES 
-    # ───────────────────────────────────────
-    "employee experience": {
-        "employee engagement", "retention"
-    },
-    "talent acquisition": {
-        "recruitment", "sourcing"
-    },
-    "workforce planning": {
-        "hr strategies", "talent management"
-    },
-    "organizational development": {
-        "change management", "hr strategies"
-    },
-
-    # ───────────────────────────────────────
-    # PROJECT / DELIVERY EDGE CASES
-    # ───────────────────────────────────────
-    "program delivery": {
-        "program management", "project management"
-    },
-    "stakeholder engagement": {
-        "stakeholder management", "communication"
-    },
-    "execution": {
-        "project management", "delivery"
-    },
-
-    # ───────────────────────────────────────
-    # OPERATIONS EDGE CASES
-    # ───────────────────────────────────────
-    "process automation": {
-        "automation", "process improvement"
-    },
-    "business process management": {
-        "process improvement", "operations"
-    },
-    "supply planning": {
-        "supply chain", "operations"
-    },
-
-    # ───────────────────────────────────────
-    # SOFT SKILLS EDGE CASES 
-    # ───────────────────────────────────────
-    "problem solving ability": {
-        "analytical skills"
-    },
-    "decision making ability": {
-        "analytical skills"
-    },
-    "time management": {
-        "productivity", "project management"
-    },
-    "adaptability": {
-        "learning", "collaboration"
-    },
-    "ownership": {
-        "accountability", "responsibility"
-    },
-
-})
-
-
-def _layer2_match(jd_skill_norm: str, resume_skills: set[str]) -> bool:
-    """
-    Check if any resume skill satisfies the JD skill via the implied map.
-    Also checks the reverse: if a specific resume skill implies a broad JD term.
-    """
-    implied = IMPLIED_SKILL_MAP.get(jd_skill_norm, set())
-    if implied & resume_skills:
-        return True
-
-    # Reverse: resume has a broad term that contains the JD skill
-    for rs in resume_skills:
-        rs_implied = IMPLIED_SKILL_MAP.get(rs, set())
-        if jd_skill_norm in rs_implied:
-            return True
-
-    return False
+async def _extract_and_normalise_combined(
+    resume_text: str,
+    jd_text: str,
+    llm: ChatOpenAI,
+) -> tuple[list[str], list[str], dict[str, str], dict[str, str]]:
+    exp_section = _extract_experience_section(resume_text)
+
+    prompt = f"""You are a skill extraction and normalisation engine. Complete ALL tasks below in one pass.
+
+════════════════════════════════════════════════════════════
+TASK 1 — Extract skills from RESUME
+════════════════════════════════════════════════════════════
+A) Explicit skills: everything directly stated in skills sections,
+   certifications, tools, technologies, and methodologies.
+
+B) Implied skills: read every work experience bullet and infer skills
+   that are STRONGLY demonstrated even if not explicitly named.
+   Valid inference examples:
+   - "Managed P&L of $50M" → financial management, budgeting, forecasting
+   - "Led team of 15 engineers" → team leadership, performance management
+   - "Reduced infra costs 40% via cloud migration" → cloud, cost optimisation
+   - "Built CI/CD pipeline" → cicd, devops, automation
+   - "Conducted SEBI filings" → regulatory compliance, financial reporting
+   - "Performed appendectomies" → surgical experience, clinical skills
+   Only infer if you are CONFIDENT. Do not guess or hallucinate.
+
+C) Deduplicate: merge all variants into one canonical lowercase form.
+   - "ReactJS" + "React.js" + "React framework" → "react"
+   - "Postgres" + "PostgreSQL" → "postgresql"
+   - "CI/CD" + "GitLab CI/CD" → "cicd"
+   - "ML" + "machine learning" → "machine learning"
+
+════════════════════════════════════════════════════════════
+TASK 2 — Extract skills from JOB DESCRIPTION
+════════════════════════════════════════════════════════════
+- Include must-have AND nice-to-have / preferred skills.
+- Include soft skills, tools, methodologies, and domain knowledge.
+- Deduplicate variants the same as Task 1C above.
+
+════════════════════════════════════════════════════════════
+TASK 3 — Build canonical mapping for BOTH lists
+════════════════════════════════════════════════════════════
+For every skill in both output lists, provide raw → canonical mapping.
+Canonical = short (1-3 words), lowercase, standard industry term.
+Every item in resume_skills and jd_skills MUST appear as a key here.
+
+════════════════════════════════════════════════════════════
+OUTPUT — STRICT JSON ONLY, no markdown, no explanation
+════════════════════════════════════════════════════════════
+{{
+  "resume_skills": ["skill1", "skill2", ...],
+  "jd_skills": ["skill1", "skill2", ...],
+  "resume_mapping": {{"raw_skill": "canonical", ...}},
+  "jd_mapping": {{"raw_skill": "canonical", ...}}
+}}
+
+Hard rules:
+- resume_mapping MUST have one entry per item in resume_skills
+- jd_mapping MUST have one entry per item in jd_skills
+- All keys and values must be lowercase
+- No markdown fences, no preamble, no trailing explanation
+
+--- RESUME (full) ---
+{resume_text}
+
+--- RESUME EXPERIENCE SECTION (for implied inference) ---
+{exp_section[:3000]}
+
+--- JOB DESCRIPTION (full) ---
+{jd_text}"""
+
+    messages = [
+        SystemMessage(
+            content="You are a deterministic extraction and normalisation engine. "
+                    "Return only valid JSON."
+        ),
+        HumanMessage(content=prompt),
+    ]
+
+    try:
+        raw     = await llm.ainvoke(messages)
+        content = _clean_llm_json(raw.content)
+        data    = json.loads(content)
+
+        resume_skills  = [str(s) for s in data.get("resume_skills", [])]
+        jd_skills      = [str(s) for s in data.get("jd_skills",     [])]
+        resume_mapping = {k.lower(): v.lower()
+                          for k, v in data.get("resume_mapping", {}).items()}
+        jd_mapping     = {k.lower(): v.lower()
+                          for k, v in data.get("jd_mapping",     {}).items()}
+
+        for s in resume_skills:
+            if s.lower() not in resume_mapping:
+                resume_mapping[s.lower()] = _basic_normalize(s)
+        for s in jd_skills:
+            if s.lower() not in jd_mapping:
+                jd_mapping[s.lower()] = _basic_normalize(s)
+
+        print(f"[Combined extract] Resume: {len(resume_skills)} skills, "
+              f"JD: {len(jd_skills)} skills")
+        print(f"[Combined extract] Resume mapping sample: "
+              f"{list(resume_mapping.items())[:5]}")
+        print(f"[Combined extract] JD mapping sample: "
+              f"{list(jd_mapping.items())[:5]}")
+
+        return resume_skills, jd_skills, resume_mapping, jd_mapping
+
+    except Exception as e:
+        print(f"[WARN] Combined extraction failed ({e}) — falling back to rule-based")
+        resume_skills  = list(extract_skills(resume_text))
+        jd_skills      = list(extract_skills(jd_text))
+        resume_mapping = {s.lower(): _basic_normalize(s) for s in resume_skills}
+        jd_mapping     = {s.lower(): _basic_normalize(s) for s in jd_skills}
+        return resume_skills, jd_skills, resume_mapping, jd_mapping
+
+
+def _apply_mapping(raw_skills: list[str], mapping: dict[str, str]) -> set[str]:
+    result = set()
+    for s in raw_skills:
+        key = s.lower()
+        result.add(mapping.get(key, _basic_normalize(s)))
+    return result
 
 
 # =============================================================================
-# LAYER 3 — Embedding semantic fallback
-# Only called for JD skills that failed Layers 1 + 2
+# LAYER 1 — Exact match
 # =============================================================================
 
-EMBEDDING_THRESHOLD = 0.85          # default for tech / hard skills
-SOFT_SKILL_EMBEDDING_THRESHOLD = 0.80  # lower threshold for soft / behavioural skills
+def _l1_exact_match(jd_canonical: str, resume_canonicals: set[str]) -> bool:
+    return jd_canonical in resume_canonicals or any(
+        _exact_overlap(jd_canonical, rs) for rs in resume_canonicals
+    )
 
-# Detect soft / behavioural skills that warrant a lower threshold
+
+# =============================================================================
+# LAYER 2 — Embedding similarity
+# =============================================================================
+
+EMBEDDING_THRESHOLD  = 0.82
+SOFT_SKILL_THRESHOLD = 0.78
+
 _SOFT_SKILL_KEYWORDS = re.compile(
     r'\b(communication|collaboration|leadership|management|'
     r'stakeholder|influenc|negotiat|coaching|facilitat|'
@@ -1709,9 +329,8 @@ _SOFT_SKILL_KEYWORDS = re.compile(
 
 
 def _embedding_threshold_for(skill: str) -> float:
-    """Return a lower threshold for soft / behavioural skills."""
     return (
-        SOFT_SKILL_EMBEDDING_THRESHOLD
+        SOFT_SKILL_THRESHOLD
         if _SOFT_SKILL_KEYWORDS.search(skill)
         else EMBEDDING_THRESHOLD
     )
@@ -1730,306 +349,253 @@ async def _embedding_match(
     unmatched_jd_skills: set[str],
     resume_skills: set[str],
     embedder: OpenAIEmbeddings,
-    threshold: float = EMBEDDING_THRESHOLD,
-) -> set[str]:
-    """
-    For each unmatched JD skill, embed it and all resume skills,
-    then check cosine similarity. Return JD skills that find a
-    resume match above the threshold.
-
-    Uses per-skill dynamic threshold via _embedding_threshold_for().
-    Only called for skills that failed Layers 1 + 2 — keeps cost low.
-    """
+) -> dict[str, tuple[str, float]]:
     if not unmatched_jd_skills or not resume_skills:
-        return set()
+        return {}
 
     jd_list = sorted(unmatched_jd_skills)
     rs_list = sorted(resume_skills)
 
-    print(f"[Embedding Layer 3] embedding {len(jd_list)} JD skills + {len(rs_list)} resume skills")
+    print(f"[Embedding L2] {len(jd_list)} JD skills vs {len(rs_list)} resume skills")
 
-    # Embed in parallel
     jd_embeddings, rs_embeddings = await asyncio.gather(
         embedder.aembed_documents(jd_list),
         embedder.aembed_documents(rs_list),
     )
 
-    semantic_matches: set[str] = set()
+    hits: dict[str, tuple[str, float]] = {}
     for jd_skill, jd_vec in zip(jd_list, jd_embeddings):
-        skill_threshold = _embedding_threshold_for(jd_skill)   # dynamic per-skill threshold
-        best_sim = 0.0
-        best_rs = ""
+        threshold = _embedding_threshold_for(jd_skill)
+        best_sim  = 0.0
+        best_rs   = ""
         for rs_skill, rs_vec in zip(rs_list, rs_embeddings):
             sim = _cosine_similarity(jd_vec, rs_vec)
             if sim > best_sim:
                 best_sim = sim
-                best_rs = rs_skill
-        if best_sim >= skill_threshold:
-            print(f"  [embed match] '{jd_skill}' ↔ '{best_rs}'  sim={best_sim:.3f}  threshold={skill_threshold}")
-            semantic_matches.add(jd_skill)
+                best_rs  = rs_skill
+        if best_sim >= threshold:
+            print(f"  [embed hit]  '{jd_skill}' ↔ '{best_rs}'  "
+                  f"sim={best_sim:.3f} (threshold={threshold})")
+            hits[jd_skill] = (best_rs, best_sim)
         else:
-            print(f"  [embed no-match] '{jd_skill}' best='{best_rs}' sim={best_sim:.3f}  threshold={skill_threshold}")
+            print(f"  [embed miss] '{jd_skill}' best='{best_rs}' "
+                  f"sim={best_sim:.3f} (threshold={threshold})")
 
-    return semantic_matches
+    return hits
 
 
 # =============================================================================
-# Depth detection — pure Python, fully deterministic, NO LLM
+# COMBINED LAYER 3 + PROFICIENCY — Single LLM call
 # =============================================================================
 
-# Phrases that OVERRIDE shallow qualifiers — checked FIRST before any shallow logic.
-# If any of these appear near a skill, the skill is NEVER shallow.
-_STRONG_DEPTH = re.compile(
-    r"\b("
-    # Explicit years of experience (various forms)
-    r"\d+\s*\+?\s*years?\s+(?:of\s+)?(?:experience|exp)\b"
-    r"|\d+\s*\+?\s*yrs?\s+(?:of\s+)?(?:experience|exp)\b"
-    r"|\d+\s*\+?\s*years?\s+in\b"
-    # Strong knowledge qualifiers (NOT the same as bare "knowledge of")
-    r"|strong\s+knowledge\b"
-    r"|deep\s+knowledge\b"
-    r"|expert\s+knowledge\b"
-    r"|in.depth\s+knowledge\b"
-    r"|solid\s+knowledge\b"
-    r"|extensive\s+knowledge\b"
-    # Proficiency / expertise markers
-    r"|proficien\w*"
-    r"|expertise\b"
-    r"|expert\s+in\b"
-    r"|specialist\b"
-    r"|specialised\b"
-    r"|specialized\b"
-    # Hands-on / practical proof
-    r"|hands.on\s+experience\b"
-    r"|hands.on\s+exposure\b"
-    r"|solid\s+experience\b"
-    r"|proven\s+experience\b"
-    r"|extensive\s+experience\b"
-    r"|significant\s+experience\b"
-    r"|rich\s+experience\b"
-    r"|direct\s+experience\b"
-    r"|practical\s+experience\b"
-    r"|real.world\s+experience\b"
-    # Seniority / ownership signals
-    r"|led\b|architected\b|owned\b|spearheaded\b"
-    r"|production\b|at\s+scale\b|enterprise\b"
-    r"|team\s+of\b|mentored\b|principal\b|senior\b"
-    r"|end.to.end\b|from\s+scratch\b"
-    r"|p&l\s+responsibility\b|board.level\b|cross.functional\b"
-    r"|company.wide\b|org.wide\b|enterprise.wide\b"
-    r"|managed\s+a\s+team\b|team\s+of\s+\d+\b"
-    r"|budget\s+of\b|revenue\s+of\b|\$[\d]+[mk]\b"
-    r"|c.suite\b|vp.level\b|director.level\b"
-    r"|full.cycle\b|end.to.end\b|portfolio\s+of\b"
-    r"|signed\b|closed\b|won\b|delivered\b"
-    r"|certified\b|certification\b"
-    r")\b",
-    re.IGNORECASE,
-)
+def _extract_relevant_sentences(
+    skill: str,
+    resume_text: str,
+    raw_aliases: list[str] | None = None,
+    max_sentences: int = 8,
+) -> list[str]:
+    search_terms = [_basic_normalize(skill)]
+    if raw_aliases:
+        search_terms += [_basic_normalize(a) for a in raw_aliases]
+    search_terms = list(dict.fromkeys(search_terms))
 
-# Qualifier words that signal shallow depth near a skill mention.
-# IMPORTANT: "knowledge of" alone is shallow, but "strong knowledge of" is NOT
-# (handled by _STRONG_DEPTH check running first).
-_DEPTH_QUALIFIERS = [
-    r"\bbasics?\b",
-    r"\bfundamentals?\b",
-    r"\bintro(?:duction)?\b",
-    r"\bawareness\b",
-    r"\bfamiliar(?:ity)?\b",           # covers "familiar with" and "familiarity"
-    r"\bsome experience\b",
-    r"\bexposure\b",
-    r"\blimited\b",
-    r"\bentry.?level\b",
-    r"\bbeginners?\b",
-    r"\bworking knowledge\b",          # "working knowledge" = shallow (not "strong knowledge")
-    r"\bbasic knowledge\b",
-    r"\bknowledge of\b",               # bare "knowledge of X" without strong modifier = shallow
-    r"\bunderstanding of\b",           # bare "understanding of X" = shallow
-    r"\baware(?:ness)?\b",
-    r"\bnovice\b",
-    r"\blearning\b",
-    r"\bexploring\b",
-    r"\btheoretical\b",
-]
-_DEPTH_RE = re.compile("|".join(_DEPTH_QUALIFIERS), re.IGNORECASE)
+    sentences   = re.split(r'(?<=[.!?\n])\s+', resume_text)
+    relevant:   list[str] = []
+    seen_sents: set[str]  = set()
 
-# Action verbs that prove real hands-on work
-# Extended to cover non-tech business / operational verbs
-_EVIDENCE_VERBS = re.compile(
-    r"\b(developed|implementing|implemented|built|designed|deployed|managed|"
-    r"created|integrated|optimised|optimized|architected|led|migrated|"
-    r"maintained|configured|automated|wrote|established|reduced|improved|"
-    r"worked|used|utilised|utilized|delivered|shipped|set.?up|"
-    r"build|builds|building|handles|handling|involved|contributed|"
-    r"responsible|owns|owned|spearheaded|enhanced|resolved|debugged|"
-    r"tested|reviewed|refactored|scaled|orchestrated|provisioned|"
-    r"monitored|secured|analysed|analyzed|modelled|modeled|"
-    r"trained|fine.tuned|published|released|launched|"
-    r"negotiated|facilitated|presented|budgeted|forecasted|hired|"
-    r"onboarded|coached|counselled|counseled|advised|consulted|"
-    r"partnered|liaised|coordinated|oversaw|supervised|directed|"
-    r"pitched|closed|generated|grew|expanded|retained|"
-    r"audited|assessed|evaluated|approved|"
-    r"authored|drafted|filed|"
-    r"restructured|transformed|streamlined|standardized|standardised|"
-    r"fundraised|allocated|reconciled|reported|"
-    r"prioritised|prioritized|influenced|aligned|secured|"
-    r"exceeded|surpassed|achieved|attained|"
-    r"recruited|sourced|screened|interviewed|"
-    r"signed|renewed|renegotiated|executed|"
-    r"rolled.out|championed|"
-    r"identified|proposed|recommended|formulated|"
-    r"managed\s+\w+\s+team|led\s+\w+\s+team|"
-    # Non-tech / HR / finance specific verbs
-    r"administered|processed|coordinated|ensured|conducted|"
-    r"assisted|supported|handled|performed|prepared|"
-    r"organized|organised|maintained|tracked|monitored|"
-    r"resolved|addressed|provided|delivered|shared|"
-    r"assisted\s+in|helped|participated|contributed)\b",
-    re.IGNORECASE,
-)
-
-
-def _skill_contexts(skill: str, resume_text: str, window: int = 400) -> list[str]:
-    """Return ALL text snippets around every occurrence of the skill."""
-    text_lower = resume_text.lower()
-    norm = normalize_skill(skill)
-    patterns = []
-    try:
-        patterns.append(_word_boundary_re(norm))
-    except re.error:
-        pass
-    if norm != skill.lower():
+    for term in search_terms:
         try:
-            patterns.append(_word_boundary_re(skill.lower()))
+            pattern = _word_boundary_re(term)
         except re.error:
-            pass
+            pattern = None
 
-    contexts = []
-    seen_positions: set[int] = set()
-    for pat in patterns:
-        for m in pat.finditer(text_lower):
-            bucket = m.start() // 100
-            if bucket in seen_positions:
+        for sent in sentences:
+            sent_clean = sent.strip()
+            if not sent_clean or sent_clean in seen_sents:
                 continue
-            seen_positions.add(bucket)
-            start = max(0, m.start() - window)
-            end = min(len(text_lower), m.end() + window)
-            contexts.append(text_lower[start:end])
-    return contexts
+            matched = (
+                pattern.search(sent_clean.lower()) if pattern
+                else term in sent_clean.lower()
+            )
+            if matched:
+                relevant.append(sent_clean)
+                seen_sents.add(sent_clean)
+            if len(relevant) >= max_sentences:
+                return relevant
+
+    return relevant
 
 
-def _has_experience_evidence(skill: str, resume_text: str) -> bool:
-    """
-    True if ANY occurrence of the skill appears alongside a real action verb.
-    Checks ALL occurrences so a skills-list entry can't hide a strong
-    experience-section entry.
-    """
-    for ctx in _skill_contexts(skill, resume_text, window=400):
-        if _EVIDENCE_VERBS.search(ctx):
-            return True
-    return False
+async def _classify_and_assess_unmatched(
+    unmatched_jd_skills: set[str],
+    matched_jd_skills: set[str],
+    resume_text: str,
+    jd_text: str,
+    llm: ChatOpenAI,
+    jd_mapping: dict[str, str] | None = None,
+    resume_mapping: dict[str, str] | None = None,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    if not unmatched_jd_skills and not matched_jd_skills:
+        return {}, {}
 
+    canonical_to_raws: dict[str, list[str]] = {}
+    if jd_mapping:
+        for raw, canon in jd_mapping.items():
+            canonical_to_raws.setdefault(canon, []).append(raw)
 
-def _has_strong_depth(skill: str, resume_text: str) -> bool:
-    """
-    True if any context around the skill contains strong depth signals
-    (years of experience, proficiency, expertise, hands-on experience,
-    strong/deep knowledge, led, certified, production, P&L, etc.).
-    These override any shallow qualifier words.
-    """
-    for ctx in _skill_contexts(skill, resume_text, window=300):
-        if _STRONG_DEPTH.search(ctx):
-            return True
-    return False
+    unmatched_with_evidence = []
+    for skill in sorted(unmatched_jd_skills):
+        aliases  = canonical_to_raws.get(skill, [])
+        evidence = _extract_relevant_sentences(
+            skill, resume_text, raw_aliases=aliases, max_sentences=6
+        )
+        unmatched_with_evidence.append({
+            "skill":              skill,
+            "evidence_sentences": evidence,
+        })
 
+    matched_with_evidence = []
+    for skill in sorted(matched_jd_skills):
+        aliases  = canonical_to_raws.get(skill, [])
+        evidence = _extract_relevant_sentences(
+            skill, resume_text, raw_aliases=aliases, max_sentences=5
+        )
+        matched_with_evidence.append({
+            "skill":           skill,
+            "resume_evidence": evidence if evidence else [
+                "(mentioned but no specific sentences found)"
+            ],
+        })
 
-def _skill_in_competency_section(skill: str, resume_text: str) -> bool:
-    """
-    Returns True if the skill appears in a dedicated skills/competencies section.
-    Skills listed in Core Competencies, Technical Skills, Key Skills etc.
-    are real skills — they should NOT be marked shallow just because no
-    action verb appears in that bullet.
+    prompt = f"""You are an expert recruiter completing two tasks in one pass.
 
-    Strategy: if the skill's surrounding context looks like a skills-list
-    (very short snippet, comma/pipe/bullet separated items, no verb), we still
-    treat it as a genuine skill rather than shallow.
-    """
-    text_lower = resume_text.lower()
+--- JOB DESCRIPTION (first 800 chars) ---
+{jd_text[:800]}
 
-    # Common section headers for skills blocks
-    skills_section_re = re.compile(
-        r'\b(core competenc|key competenc|technical skills?|key skills?|'
-        r'skills? summary|areas of expertise|competenc|proficienc|'
-        r'tools?\s*(?:&|and)\s*technolog|tools?\s*used|'
-        r'hr tools?|software\s+skills?|professional\s+skills?)\b',
-        re.IGNORECASE,
-    )
+--- RESUME BROAD CONTEXT (first 1500 chars) ---
+{resume_text[:1500]}
 
-    # Find section headers in the text
-    for header_match in skills_section_re.finditer(text_lower):
-        # Get the next 600 chars after the header
-        section_start = header_match.start()
-        section_text = text_lower[section_start: section_start + 600]
+════════════════════════════════════════════════════════════
+TASK A — Evidence reasoning for UNMATCHED skills
+════════════════════════════════════════════════════════════
+For each skill below, judge whether the resume DEMONSTRATES it through
+actual work experience — even if the exact term is absent.
 
-        norm = normalize_skill(skill)
-        try:
-            if _word_boundary_re(norm).search(section_text):
-                return True
-        except re.error:
-            if norm in section_text:
-                return True
+Look for:
+- Direct mentions with any variation of the skill name
+- Work experience that implies the skill
+- Projects or achievements requiring the skill
 
-    return False
+Rules:
+- Return matched=true ONLY if you have real evidence, not assumption
+- Be conservative — if genuinely unsure, return false
+- Only return matched=true if confidence >= 0.65
 
+Skills to evaluate (with extracted evidence sentences):
+{json.dumps(unmatched_with_evidence, indent=2)}
 
-def _is_shallow_mention(skill: str, resume_text: str) -> bool:
-    """
-    Returns True ONLY when ALL of these hold:
-    1. No strong depth signals anywhere (years exp, proficiency, strong knowledge,
-       led, production, certified, hands-on experience, etc.)
-    2. No action-verb evidence anywhere in the resume.
-    3. The skill is NOT listed in a dedicated competency/skills section.
-    4. Every mention is near a depth-qualifier word.
+════════════════════════════════════════════════════════════
+TASK B — Proficiency assessment for MATCHED skills
+════════════════════════════════════════════════════════════
+For each skill below, rate depth of experience from the evidence sentences
+AND the broad resume context above.
 
-    If the candidate has even one real usage sentence → never shallow.
-    If the skill appears in a skills/competencies block → never shallow.
-    """
-    # Strong depth signal overrides everything
-    if _has_strong_depth(skill, resume_text):
-        return False
+Scoring guide:
+- 5 = Expert / Architected / Led at scale / 5+ years explicit
+- 4 = Proficient / Hands-on project experience / 3-5 years
+- 3 = Solid working experience / 1-3 years / multiple projects
+- 2 = Basic / Limited exposure / mentioned without real detail
+- 1 = Skills list only / "familiar with" / "knowledge of" / no evidence
 
-    # Real usage found anywhere → not shallow
-    if _has_experience_evidence(skill, resume_text):
-        return False
+Level mapping:
+- score 4-5 → "deep"
+- score 3   → "adequate"
+- score 1-2 → "shallow"
 
-    # Skill listed in a competency / skills section → treat as genuine
-    if _skill_in_competency_section(skill, resume_text):
-        return False
+Skills to assess (with extracted evidence sentences):
+{json.dumps(matched_with_evidence, indent=2)}
 
-    # No real usage — check if ALL contexts have qualifier words
-    contexts = _skill_contexts(skill, resume_text)
-    if not contexts:
-        return False
+════════════════════════════════════════════════════════════
+OUTPUT — STRICT JSON ONLY, no markdown, no explanation
+════════════════════════════════════════════════════════════
+{{
+  "evidence_results": {{
+    "skill_name": {{
+      "matched": true,
+      "confidence": 0.85,
+      "reason": "one concise sentence"
+    }}
+  }},
+  "proficiency_results": {{
+    "skill_name": {{
+      "score": 4,
+      "level": "deep",
+      "reason": "one concise sentence"
+    }}
+  }}
+}}"""
 
-    return all(_DEPTH_RE.search(ctx) for ctx in contexts)
+    messages = [
+        SystemMessage(
+            content="You are a deterministic recruiter evaluator. "
+                    "Return only valid JSON."
+        ),
+        HumanMessage(content=prompt),
+    ]
+
+    evidence_results:    dict[str, dict] = {}
+    proficiency_results: dict[str, dict] = {}
+
+    try:
+        raw     = await llm.ainvoke(messages)
+        content = _clean_llm_json(raw.content)
+        data    = json.loads(content)
+
+        raw_evidence = data.get("evidence_results", {})
+        for skill in unmatched_jd_skills:
+            skill_data = raw_evidence.get(skill, {})
+            evidence_results[skill] = {
+                "matched":    bool(skill_data.get("matched",    False)),
+                "confidence": float(skill_data.get("confidence", 0.0)),
+                "reason":     str(skill_data.get("reason",      "")),
+            }
+            r = evidence_results[skill]
+            print(f"  [L3] '{skill}' matched={r['matched']} "
+                  f"conf={r['confidence']:.2f} | {r['reason'][:80]}")
+
+        raw_proficiency = data.get("proficiency_results", {})
+        for skill in matched_jd_skills:
+            skill_data = raw_proficiency.get(skill, {})
+            proficiency_results[skill] = {
+                "level":  str(skill_data.get("level",  "adequate")),
+                "score":  int(skill_data.get("score",  3)),
+                "reason": str(skill_data.get("reason", "")),
+            }
+            p = proficiency_results[skill]
+            print(f"  [Prof] '{skill}' level={p['level']} "
+                  f"score={p['score']} | {p['reason'][:70]}")
+
+    except Exception as e:
+        print(f"[WARN] Combined L3+proficiency failed ({e}) — using safe defaults")
+        for skill in unmatched_jd_skills:
+            evidence_results[skill] = {
+                "matched": False, "confidence": 0.0, "reason": "LLM error"
+            }
+        for skill in matched_jd_skills:
+            proficiency_results[skill] = {
+                "level": "adequate", "score": 3, "reason": "assessment unavailable"
+            }
+
+    return evidence_results, proficiency_results
 
 
 # =============================================================================
-# OR-group handling  ("AWS, Azure, or GCP" / "AWS/Azure/GCP" → needs only ONE)
+# OR-group handling
 # =============================================================================
 
 def _extract_or_groups(jd_text: str) -> list[set[str]]:
-    """
-    Detect skill alternatives in the JD. Handles:
-    - Comma-separated lists ending with 'or X'   ("AWS, Azure, or GCP")
-    - Slash-separated alternatives                ("AWS/Azure/GCP")
-    - Either...or patterns                        ("either Kafka or RabbitMQ")
-    Returns each group as a set of normalised skill names.
-    """
     groups: list[set[str]] = []
 
-    # Pattern 1: comma/or lists  ("AWS, Azure, or GCP")
     comma_or_pattern = re.compile(
         r'(?:such as|like|including|e\.g\.?|:)?\s*'
         r'([A-Za-z0-9][A-Za-z0-9\.\+\#/\-]*'
@@ -2042,17 +608,14 @@ def _extract_or_groups(jd_text: str) -> list[set[str]]:
         cleaned: set[str] = set()
         for p in raw_parts:
             p = re.sub(
-                r'^(?:such as|like|including|e\.g\.?|:)\s*', '',
-                p, flags=re.IGNORECASE,
+                r'^(?:such as|like|including|e\.g\.?|:)\s*', '', p, flags=re.IGNORECASE
             )
-            norm = normalize_skill(p.strip())
+            norm = _basic_normalize(p.strip())
             if norm and len(norm) > 1:
                 cleaned.add(norm)
         if len(cleaned) > 1:
             groups.append(cleaned)
 
-    # Pattern 2: slash-separated tech alternatives ("AWS/Azure/GCP", "Kafka/RabbitMQ")
-    # Only match known-tech-looking tokens (uppercase start or known patterns)
     slash_pattern = re.compile(
         r'\b([A-Za-z][A-Za-z0-9\.\+\#\-]{1,20})'
         r'(?:/([A-Za-z][A-Za-z0-9\.\+\#\-]{1,20}))+'
@@ -2060,23 +623,20 @@ def _extract_or_groups(jd_text: str) -> list[set[str]]:
     )
     for m in slash_pattern.finditer(jd_text):
         raw_parts = m.group(0).split('/')
-        cleaned = {normalize_skill(p.strip()) for p in raw_parts if len(p.strip()) > 1}
-        # Only treat as OR-group if all parts look like tech skills (not path segments)
+        cleaned = {_basic_normalize(p.strip()) for p in raw_parts if len(p.strip()) > 1}
         if len(cleaned) > 1 and not any('/' in p for p in cleaned):
             groups.append(cleaned)
 
-    # Pattern 3: "either X or Y"
     either_pattern = re.compile(
         r'\beither\s+([A-Za-z][A-Za-z0-9\.\+\#\-]*)\s+or\s+([A-Za-z][A-Za-z0-9\.\+\#\-]*)\b',
         re.IGNORECASE,
     )
     for m in either_pattern.finditer(jd_text):
-        a = normalize_skill(m.group(1).strip())
-        b = normalize_skill(m.group(2).strip())
+        a = _basic_normalize(m.group(1).strip())
+        b = _basic_normalize(m.group(2).strip())
         if a and b and len(a) > 1 and len(b) > 1:
             groups.append({a, b})
 
-    # Deduplicate groups that are subsets of each other
     unique_groups: list[set[str]] = []
     for g in groups:
         if not any(g == existing or g.issubset(existing) for existing in unique_groups):
@@ -2092,13 +652,8 @@ def _resolve_or_groups(
     matched: set[str],
     or_groups: list[set[str]],
 ) -> tuple[set[str], set[str]]:
-    """
-    For each OR-group where the candidate satisfies at least one member
-    (matched or partial), remove the unchosen alternatives from gaps.
-    """
     missing = set(missing)
     partial = set(partial)
-
     for group in or_groups:
         satisfied_by = group & (matched | partial)
         if satisfied_by:
@@ -2106,72 +661,193 @@ def _resolve_or_groups(
             missing -= unchosen
             partial -= unchosen
             print(f"[OR resolve] satisfied_by={satisfied_by}  removed={unchosen}")
-
     return missing, partial
 
 
 # =============================================================================
-# Main classify_skills — combines all three layers + depth detection
+# Main classify_skills
 # =============================================================================
 
 async def classify_skills(
-    resume_skills: set[str],
-    jd_skills: set[str],
+    resume_skills_raw: list[str],
+    jd_skills_raw: list[str],
     resume_text: str,
+    jd_text: str,
     embedder: OpenAIEmbeddings,
+    llm: ChatOpenAI,
+    resume_mapping: dict[str, str],
+    jd_mapping: dict[str, str],
 ) -> tuple[set[str], set[str], set[str]]:
-    """
-    Three-way classification for every JD skill:
-      matched  — covered with adequate depth
-      partial  — covered but shallow / basic only
-      missing  — not found by any of the three layers
+    resume_canonicals = _apply_mapping(resume_skills_raw, resume_mapping)
+    jd_canonicals     = {
+        jd_mapping.get(s.lower(), _basic_normalize(s)) for s in jd_skills_raw
+    }
 
-    Pipeline per JD skill:
-      Layer 1 → string normalisation + alias overlap
-      Layer 2 → implied-skill map
-      Layer 3 → embedding cosine similarity (only for skills still unresolved)
-      Depth   → pure Python action-verb + strong-depth + competency-section check
-    """
-    matched: set[str] = set()
-    partial: set[str] = set()
+    canonical_to_jd: dict[str, str] = {}
+    for raw in jd_skills_raw:
+        canonical = jd_mapping.get(raw.lower(), _basic_normalize(raw))
+        canonical_to_jd[canonical] = raw
+
+    l1_matched:    set[str] = set()
     still_missing: set[str] = set()
 
-    for jd_skill in jd_skills:
-        norm = normalize_skill(jd_skill)
-
-        # Layer 1: exact / variant string match
-        found_l1 = any(_exact_overlap(norm, rs) for rs in resume_skills)
-
-        # Layer 2: implied-skill map
-        found_l2 = (not found_l1) and _layer2_match(norm, resume_skills)
-
-        if found_l1 or found_l2:
-            layer = "L1" if found_l1 else "L2"
-            if _is_shallow_mention(jd_skill, resume_text):
-                print(f"  [{layer} shallow] {jd_skill}")
-                partial.add(jd_skill)
-            else:
-                print(f"  [{layer} matched] {jd_skill}")
-                matched.add(jd_skill)
+    for jd_canonical in jd_canonicals:
+        if _l1_exact_match(jd_canonical, resume_canonicals):
+            print(f"  [L1 match] '{jd_canonical}'")
+            l1_matched.add(jd_canonical)
         else:
-            still_missing.add(jd_skill)
+            still_missing.add(jd_canonical)
 
-    # Layer 3: embedding fallback for everything still unresolved
-    if still_missing:
-        semantic_hits = await _embedding_match(still_missing, resume_skills, embedder)
-        for jd_skill in still_missing:
-            if jd_skill in semantic_hits:
-                if _is_shallow_mention(jd_skill, resume_text):
-                    print(f"  [L3 shallow] {jd_skill}")
-                    partial.add(jd_skill)
-                else:
-                    print(f"  [L3 matched] {jd_skill}")
-                    matched.add(jd_skill)
-            else:
-                print(f"  [missing]    {jd_skill}")
+    embed_hits = await _with_timeout(
+        _embedding_match(still_missing, resume_canonicals, embedder),
+        timeout_seconds=20,
+        fallback={},
+        label="L2 embedding match",
+    )
+    l2_matched:    set[str] = set(embed_hits.keys())
+    still_missing -= l2_matched
 
-    missing = still_missing - matched - partial
-    return matched, partial, missing
+    all_matched_so_far = l1_matched | l2_matched
+    matched_originals  = {canonical_to_jd.get(c, c) for c in all_matched_so_far}
+    l3_candidates      = {canonical_to_jd.get(c, c) for c in still_missing}
+
+    evidence_results, proficiency_results = await _with_timeout(
+        _classify_and_assess_unmatched(
+            unmatched_jd_skills=l3_candidates,
+            matched_jd_skills=matched_originals,
+            resume_text=resume_text,
+            jd_text=jd_text,
+            llm=llm,
+            jd_mapping=jd_mapping,
+            resume_mapping=resume_mapping,
+        ),
+        timeout_seconds=30,
+        fallback=(
+            {skill: {"matched": False, "confidence": 0.0, "reason": "timeout"}
+             for skill in l3_candidates},
+            {skill: {"level": "adequate", "score": 3, "reason": "timeout fallback"}
+             for skill in matched_originals},
+        ),
+        label="L3 evidence + proficiency",
+    )
+
+    l3_matched:    set[str] = set()
+    truly_missing: set[str] = set()
+
+    for canonical in still_missing:
+        original = canonical_to_jd.get(canonical, canonical)
+        result   = evidence_results.get(original, {"matched": False})
+        if result["matched"] and result.get("confidence", 0) >= 0.65:
+            print(f"  [L3 match] '{canonical}' "
+                  f"(confidence={result.get('confidence', 0):.2f})")
+            l3_matched.add(canonical)
+        else:
+            print(f"  [missing]  '{canonical}'")
+            truly_missing.add(canonical)
+
+    all_matched_canonicals = l1_matched | l2_matched | l3_matched
+
+    final_matched: set[str] = set()
+    final_partial: set[str] = set()
+
+    for canonical in all_matched_canonicals:
+        original = canonical_to_jd.get(canonical, canonical)
+        prof     = proficiency_results.get(original, {"level": "adequate"})
+        if prof["level"] == "shallow":
+            print(f"  [shallow → partial] '{original}'")
+            final_partial.add(original)
+        else:
+            final_matched.add(original)
+
+    final_missing = {canonical_to_jd.get(c, c) for c in truly_missing}
+
+    return final_matched, final_partial, final_missing
+
+
+# =============================================================================
+# Experience helpers
+# =============================================================================
+
+def _extract_experience_section(resume_text: str) -> str:
+    patterns = [
+        r'(?i)(work\s+experience|professional\s+experience|employment\s+history'
+        r'|experience|career\s+history)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, resume_text)
+        if m:
+            return resume_text[m.start():]
+    return resume_text
+
+
+def _resolve_resume_experience(resume_text: str) -> int:
+    exp = extract_experience(resume_text)
+    if exp > 0:
+        return exp
+    text_lower = resume_text.lower()
+    if any(t in text_lower for t in ["principal", "staff engineer", "director"]):
+        return 10
+    if any(t in text_lower for t in ["senior", "lead", "architect", "head of"]):
+        return 6
+    if "engineer" in text_lower or "developer" in text_lower or "analyst" in text_lower:
+        return 3
+    if len(resume_text.split()) > 800:
+        return 3
+    return 2
+
+
+async def _extract_client_names_llm(resume_text: str, llm: ChatOpenAI) -> list[str]:
+    messages = [
+        SystemMessage(
+            content="You are a strict information extraction engine. Follow rules exactly."
+        ),
+        HumanMessage(content=f"""
+Task:
+Extract ONLY real client/company names explicitly mentioned in the resume.
+
+Rules:
+1. Include ONLY real, non-anonymised company names (e.g., Google, Walmart, Accenture).
+2. DO NOT infer, guess, or deduce from context.
+3. EXCLUDE:
+   - "Fortune 500 company"
+   - "US-based client"
+   - "Leading organization"
+   - Any vague or anonymised descriptions
+4. DO NOT include:
+   - Employers (unless explicitly stated as client)
+   - Tools/technologies (e.g., AWS, SAP, Snowflake)
+   - Certifications or education institutes
+5. If ANY doubt → DO NOT include it.
+6. Prefer returning [] over incorrect output.
+
+Return ONLY valid JSON array:
+["Client1", "Client2"]
+
+--- RESUME ---
+{resume_text}
+"""),
+    ]
+
+    try:
+        raw       = await llm.bind(temperature=0).ainvoke(messages)
+        content   = _clean_llm_json(raw.content)
+        names     = json.loads(content)
+        llm_names = (
+            [str(n).strip() for n in names if isinstance(n, str) and n.strip()]
+            if isinstance(names, list) else []
+        )
+    except Exception as e:
+        print(f"[WARN] LLM client extraction failed: {e}")
+        llm_names = []
+
+    rule_based_names = extract_client_names_advanced(resume_text)
+
+    final = set()
+    for name in llm_names + rule_based_names:
+        clean = name.strip()
+        if len(clean) > 2:
+            final.add(clean)
+    return sorted(final)
 
 
 # =============================================================================
@@ -2179,8 +855,7 @@ async def classify_skills(
 # =============================================================================
 
 def _dedupe_gaps(gap_list: list[str], all_gaps: set[str]) -> list[str]:
-    """Keep only the first occurrence for each underlying skill."""
-    seen: set[str] = set()
+    seen:   set[str] = set()
     result: list[str] = []
     for item in gap_list:
         key = next(
@@ -2194,211 +869,12 @@ def _dedupe_gaps(gap_list: list[str], all_gaps: set[str]) -> list[str]:
 
 
 # =============================================================================
-# Skill extraction (LLM)
-# =============================================================================
-
-async def _extract_skills_llm(
-    resume_text: str,
-    jd_text: str,
-    llm: ChatOpenAI,
-) -> tuple[set[str], set[str]]:
-    """
-    Extract skills from both documents using the LLM.
-    Normalises immediately. Falls back to rule-based on any failure.
-    """
-    pydantic_parser = PydanticOutputParser(pydantic_object=SkillExtractionResponse)
-    fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
-
-    prompt_text = f"""
-You are a skill extraction engine. You work across ALL role types:
-backend, frontend, fullstack, data engineering, ML/AI, mobile, devops,
-QA, security, cloud, product management, finance, accounting, HR, people operations,
-sales, marketing, operations, supply chain, legal, compliance, strategy,
-consulting, and any other domain.
-
-### Objective
-Extract ALL skills from both the Resume and the Job Description.
-
-### Rules
-- Parse the ENTIRE document — every section, every bullet, every tech stack line.
-- Extract explicitly mentioned AND strongly implied skills.
-- CRITICAL: Extract skills from ALL resume sections including:
-    * "Core Competencies", "Key Skills", "Skills Summary", "Areas of Expertise"
-    * "Technical Skills", "Tools", "Certifications"
-    * "Professional Experience" bullets
-    * "Achievements" and "Projects" sections
-    * Professional summary / objective paragraph
-- Include skills from "Nice-to-Have" / "Good-to-Have" / "Preferred" sections of the JD.
-- Do NOT invent skills not present in the text.
-- Do NOT skip soft skills, leadership competencies, or business skills if they are listed.
-- Treat business/functional skills with the same rigour as technical skills.
-- Certifications count as skills (e.g. CHRP → "hr certification", PMP → "project management").
-- Tool names in a "Tools" section ARE skills (Workday → "hr information systems").
-
-### Normalisation (apply before returning)
-- Canonical lowercase, max 3 words per skill.
-- Expand acronyms:
-    "ML" → "machine learning", "CI/CD" → "cicd", "K8s" → "kubernetes",
-    "NLP" → "natural language processing", "IaC" → "iac",
-    "OOP" → "object oriented programming",
-    "FP&A" → "financial planning and analysis", "P&L" → "profit and loss",
-    "GTM" → "gtm strategy", "DEI" → "diversity and inclusion",
-    "L&D" → "learning and development", "S&OP" → "sales and operations planning",
-    "CRM" → "crm", "ERP" → "erp", "KPI" → "kpi management",
-    "HRIS" → "hr information systems", "HRBP" → "hr business partner",
-    "OD" → "change management", "BGV" → "recruitment",
-    "ATS" → "applicant tracking system", "MIS" → "financial reporting",
-    "SHRM" → "hr certification", "CIPD" → "hr certification",
-    "CHRP" → "hr certification", "PHR" → "hr certification",
-    "BPM" → "process improvement", "RCA" → "process improvement",
-    "SOP" → "process improvement", "OKRs" → "performance management",
-    "KRAs" → "performance management", "360" → "performance management".
-
-- Collapse variants to one canonical form:
-    "Workday" / "SAP SuccessFactors" / "Zoho People" / "BambooHR" / "Darwinbox"
-        → "hr information systems"
-    "HR Operations & Compliance" → "hr operations" AND "compliance"
-    "Labor Laws" / "Labour Laws" → "labor laws"
-    "Talent Acquisition" → "recruitment"
-    "Performance Appraisal" / "Appraisal" → "performance reviews"
-    "Conflict Resolution" → "employee relations"
-    "Exit Interviews" → "offboarding"
-    "Employee Retention" / "Attrition" → "retention"
-    "Payroll Coordination" / "Payroll Processing" → "payroll management"
-    "Headcount Planning" / "Manpower Planning" → "workforce planning"
-    "Organizational Development" / "OD" → "change management"
-    "MIS Reporting" / "Management Reporting" → "financial reporting"
-    "Cost Analysis" / "Cost Management" → "financial analysis"
-    "Tally" / "QuickBooks" / "Zoho Books" / "Xero" → "accounting software"
-    "Naukri" / "Naukri RMS" / "LinkedIn Recruiter" → "recruitment"
-    "HR Policies" / "Policy Implementation" → "hr operations"
-    "Employee Handbook" → "hr operations"
-    "Culture Building" / "Employer Branding" → "employee engagement"
-    "Pulse Surveys" / "Stay Interviews" / "ESAT" → "employee engagement"
-    "Goal Setting" / "OKRs" / "KRAs" → "performance management"
-    "360 Feedback" → "performance management"
-    "People Analytics" / "Workforce Analytics" → "hr analytics"
-    "Induction" / "Joining Formalities" → "employee onboarding"
-    "Training Delivery" / "Facilitation" → "learning and development"
-    "CTC Structuring" / "Salary Benchmarking" → "compensation and benefits"
-    "MS Excel" / "Advanced Excel" → "excel"
-    "MS Office" / "Microsoft Office" → "microsoft office"
-    "Google Workspace" / "G Suite" → "productivity tools"
-    "Power BI" / "Tableau" / "Looker" → "data visualization"
-    "HubSpot" / "Zoho CRM" / "MS Dynamics" → "crm"
-    "SAP FICO" / "SAP FI" → "sap"
-    "Prosci" → "change management certification"
-    "Node.js" / "NodeJS" → "node.js"
-    "React.js" / "ReactJS" → "react"
-    "Postgres SQL" / "Postgres" → "postgresql"
-    "Kafka Connect" / "Kafka topic" → "kafka"
-    "Spring Security" → "security"
-    "JUnit" → "unit testing"
-    "GitHub Actions" → "cicd"
-    "GitLab CI/CD" → "cicd"
-    "Apache Spark" / "PySpark" → "spark"
-    "Golang" / "Go language" → "go"
-    ".NET Core" / "ASP.NET" → ".net"
-
-- Deduplicate — return each skill exactly once.
-- Strip depth qualifiers from skill names:
-    "AWS basics" → "aws"
-    "working knowledge of CI/CD" → "cicd"
-    "familiarity with Docker" → "docker"
-    "understanding of Kubernetes" → "kubernetes"
-    "exposure to SAP" → "sap"
-    "basic P&L understanding" → "profit and loss"
-    "knowledge of labor laws" → "labor laws"
-    "strong knowledge of compliance" → "compliance"
-
-### Few-shot examples (non-tech roles)
-  Input                                    → Output
-  "HR Operations & Compliance"             → "hr operations", "compliance"
-  "Ensuring compliance with labor laws"    → "compliance", "labor laws"
-  "Improved employee retention by 15%"     → "retention"
-  "Onboarding & Training"                  → "employee onboarding", "learning and development"
-  "Exit interviews"                        → "offboarding"
-  "Build relationships, resolve conflicts" → "interpersonal skills", "employee relations"
-  "Drive organizational growth via HR strategies" → "hr strategies"
-  "Workday, SAP SuccessFactors, Zoho People" → "hr information systems"
-  "Payroll Coordination & Attendance"      → "payroll management"
-  "Proficiency in HRIS tools like Workday" → "hr information systems"
-  "MIS Reporting"                          → "financial reporting"
-  "SAP FICO"                               → "sap"
-  "Tally ERP"                              → "accounting software"
-  "P&L Management"                         → "profit and loss"
-  "FP&A"                                   → "financial planning and analysis"
-  "Stakeholder Management"                 → "stakeholder management"
-  "Cross-functional collaboration"         → "cross-functional collaboration"
-  "Salesforce CRM"                         → "salesforce"
-  "GTM Strategy"                           → "gtm strategy"
-  "SAP ERP"                                → "sap"
-  "Six Sigma / Lean"                       → "six sigma", "lean"
-  "GDPR compliance"                        → "data privacy"
-  "Diversity & Inclusion"                  → "diversity and inclusion"
-  "People Management"                      → "team management"
-  "Change Management"                      → "change management"
-  "Programme Management"                   → "program management"
-  "Certified Human Resource Professional"  → "hr certification"
-  "SHRM-SCP"                               → "hr certification"
-  "Strong knowledge of labor laws"         → "labor laws"
-  "Hands-on experience with HR analytics"  → "hr analytics"
-  "Managed end-to-end recruitment"         → "recruitment"
-  "Performance review cycles"              → "performance reviews"
-  "Employee engagement activities"         → "employee engagement"
-  "ATS Platforms: Naukri RMS"              → "applicant tracking system", "recruitment"
-
-### Output — STRICT JSON ONLY (no markdown, no preamble)
-{{
-  "resume_skills": ["skill1", "skill2"],
-  "jd_skills":     ["skill1", "skill2"]
-}}
-
-{fixing_parser.get_format_instructions()}
-
---- RESUME ---
-{resume_text}
-
---- JOB DESCRIPTION ---
-{jd_text}"""
-
-    messages = [
-        SystemMessage(content=(
-            "You are a deterministic information extraction engine. "
-            "Always return valid JSON. Never vary output for the same input."
-        )),
-        HumanMessage(content=prompt_text),
-    ]
-
-    raw = await llm.ainvoke(messages)
-    print("[Skill extraction] raw response (first 600 chars):\n", raw.content[:600])
-
-    try:
-        parsed = fixing_parser.parse(raw.content)
-    except Exception as e:
-        print(f"[WARN] Skill parse error ({e}) — rule-based fallback")
-        return (
-            normalize_skills(extract_skills(resume_text)),
-            normalize_skills(extract_skills(jd_text)),
-        )
-
-    if not parsed.resume_skills and not parsed.jd_skills:
-        print("[WARN] Empty skill lists — rule-based fallback")
-        return (
-            normalize_skills(extract_skills(resume_text)),
-            normalize_skills(extract_skills(jd_text)),
-        )
-
-    return normalize_skills(parsed.resume_skills), normalize_skills(parsed.jd_skills)
-
-
-# =============================================================================
 # Analysis chain
 # =============================================================================
 
 def _build_analysis_chain(llm: ChatOpenAI):
     pydantic_parser = PydanticOutputParser(pydantic_object=ResumeAnalysisResponse)
-    fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
+    fixing_parser   = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are an expert recruiter, resume strategist, and proofreader."),
@@ -2427,10 +903,8 @@ MISSING SKILLS  → skill completely absent from resume.
 4. NEVER put a Matched skill in Key_Gaps.
 5. Recommendations MUST address every partial and missing skill.
 6. Be specific — reference actual resume evidence, not generic filler.
-7. Apply these rules equally to technical skills AND business/soft skills
-   (e.g. stakeholder management, P&L, forecasting, recruitment, labor laws).
-8. If a skill is in MATCHED SKILLS, do NOT mention it as a gap anywhere,
-   including in Score_Explanation_Technical.
+7. Apply these rules equally to technical skills AND business/soft skills.
+8. If a skill is in MATCHED SKILLS, do NOT mention it as a gap anywhere.
 ━━━━━━━━━━━━━━━━━━━━
 
 --- JOB DESCRIPTION ---
@@ -2474,7 +948,7 @@ MISSING SKILLS  → skill completely absent from resume.
 
 def _build_shrink_chain(llm: ChatOpenAI):
     pydantic_parser = PydanticOutputParser(pydantic_object=ShrinkSummaryResponse)
-    fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
+    fixing_parser   = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are an expert technical recruiter and resume summarization assistant."),
@@ -2497,123 +971,86 @@ core skills, and relevant domains from the combined text.
     )
 
 
-def _build_question_reframe_chain(llm: ChatOpenAI):
-    return PromptTemplate(
-        input_variables=["suggested_questions"],
-        template="""
-You are an expert recruiter. Refine these raw interview questions:
-rephrase clearly, remove near-duplicates, keep all distinct topics.
-
-Return ONLY a valid JSON array of strings. No explanation, no markdown.
-
-suggested_questions:
-{suggested_questions}
-""",
-    ) | llm
-
-
 # =============================================================================
-# Miscellaneous helpers
+# Interview question generation — LLM-based, domain-agnostic
+# NOTE: Defined at module level. Do NOT nest inside any route function.
 # =============================================================================
 
-def _resolve_resume_experience(resume_text: str) -> int:
-    """
-    Extract years of experience from resume.
-    Prefer explicit date ranges or year mentions.
-    Only fall back to title/length heuristics if nothing found.
-    """
-    exp = extract_experience(resume_text)
-    if exp > 0:
-        return exp
+async def _generate_interview_questions(
+    resume_text: str,
+    jd_text: str,
+    matched_skills: set[str],
+    partial_skills: set[str],
+    missing_skills: set[str],
+    llm: ChatOpenAI,
+) -> list[str]:
+    prompt = f"""You are a senior technical interviewer with 15+ years of hiring experience.
+Generate highly targeted, specific interview questions for THIS candidate and THIS role only.
 
-    # Heuristic fallback — only used when no dates/years found at all
-    text_lower = resume_text.lower()
-    if any(t in text_lower for t in ["principal", "staff engineer", "director"]):
-        return 10
-    if any(t in text_lower for t in ["senior", "lead", "architect", "head of"]):
-        return 6
-    if "engineer" in text_lower or "developer" in text_lower or "analyst" in text_lower:
-        return 3
-    if len(resume_text.split()) > 800:
-        return 3
-    return 2
+CANDIDATE CONTEXT:
+- Resume experience: {resume_text[:2000]}
 
+ROLE CONTEXT:
+- Job Description: {jd_text[:1500]}
 
-async def _extract_client_names_llm(resume_text: str, llm: ChatOpenAI) -> list[str]:
-    """
-    Strict client extraction using LLM + rule-based fallback.
-    High precision + stable output.
-    """
+SKILL CONTEXT:
+- Strong skills (probe depth): {sorted(matched_skills)}
+- Weak skills (probe gaps): {sorted(partial_skills)}  
+- Missing skills (probe transferability): {sorted(missing_skills)}
+
+GENERATE exactly 12-14 questions across these categories:
+1. TECHNICAL DEPTH (4-5 questions)
+   - Pick the 3-4 most critical matched skills
+   - Ask about architecture decisions, tradeoffs, failure scenarios
+   - Example style: "You mentioned using Kubernetes in production — walk me through how you handled a pod crash loop and what your debugging process was?"
+
+2. GAP PROBING (3-4 questions)
+   - For partial skills: give a realistic scenario and ask how they'd handle it
+   - For missing skills: ask if they've solved similar problems with different tools
+   - Example style: "You haven't worked with GCP directly — if you had to migrate an AWS workload to GCP in 30 days, what would your approach be?"
+
+3. BEHAVIORAL / SITUATIONAL (3-4 questions)
+   - Tie directly to JD responsibilities
+   - Use STAR triggers: "Tell me about a time...", "Describe a situation where..."
+   - Must reference something specific from their resume achievements
+
+4. DOMAIN / ROLE-SPECIFIC (2 questions)
+   - Test business understanding beyond technical skills
+   - Ask about industry trends, stakeholder management, or strategic thinking
+STRICT RULES:
+- Every question must reference something SPECIFIC from the resume or JD
+- No generic questions that could apply to any candidate
+- No yes/no questions
+- No duplicate themes
+- Questions must match the seniority level implied by the JD
+- Each question must end with ?
+
+Return ONLY a raw JSON array of question strings. No markdown, no explanation.
+Example: ["Question 1?", "Question 2?"]
+"""
 
     messages = [
-        SystemMessage(content=(
-            "You are a strict information extraction engine. Follow rules exactly."
-        )),
-        HumanMessage(content=f"""
-Task:
-Extract ONLY real client/company names explicitly mentioned in the resume.
-
-Rules:
-1. Include ONLY real, non-anonymised company names (e.g., Google, Walmart, Accenture).
-2. DO NOT infer, guess, or deduce from context.
-3. EXCLUDE:
-   - "Fortune 500 company"
-   - "US-based client"
-   - "Leading organization"
-   - Any vague or anonymised descriptions
-4. DO NOT include:
-   - Employers (unless explicitly stated as client)
-   - Tools/technologies (e.g., AWS, SAP, Snowflake)
-   - Certifications or education institutes
-5. If ANY doubt → DO NOT include it.
-6. Prefer returning [] over incorrect output.
-
-Return ONLY valid JSON array:
-["Client1", "Client2"]
-
---- RESUME ---
-{resume_text}
-"""),
+        SystemMessage(
+            content="You are a senior technical interviewer with deep hiring expertise. "
+                    "Return only valid JSON."
+        ),
+        HumanMessage(content=prompt),
     ]
 
     try:
-        raw = await llm.bind(temperature=0).ainvoke(messages)
-        print("******** CLIENT EXTRACTION RAW ********")
-        print(raw)
-
-        # Clean JSON
-        content = _clean_llm_json(raw.content)
-        names = json.loads(content)
-
-        if isinstance(names, list):
-            llm_names = [
-                str(n).strip()
-                for n in names
-                if isinstance(n, str) and n.strip()
-            ]
-        else:
-            llm_names = []
-
+        raw      = await llm.ainvoke(messages)
+        content  = _clean_llm_json(raw.content)
+        questions = json.loads(content)
+        if isinstance(questions, list):
+            return [str(q).strip() for q in questions if str(q).strip().endswith("?")]
     except Exception as e:
-        print(f"[WARN] LLM client extraction failed: {e}")
-        llm_names = []
+        print(f"[WARN] Question generation failed: {e}")
 
-    # ---------------- FALLBACK ----------------
-    rule_based_names = extract_client_names_advanced(resume_text)
-
-    # ---------------- MERGE + CLEAN ----------------
-    final = set()
-
-    for name in llm_names + rule_based_names:
-        clean = name.strip()
-        if len(clean) > 2:
-            final.add(clean)
-
-    return sorted(final)
+    return []
 
 
 # =============================================================================
-# Hard validation  (safety net after LLM analysis chain)
+# Hard validation — final correctness guarantee
 # =============================================================================
 
 def _apply_hard_validation(
@@ -2622,49 +1059,38 @@ def _apply_hard_validation(
     partial: set[str],
     missing: set[str],
 ) -> dict:
-    """
-    Guarantees correctness of Key_Matches and Key_Gaps regardless of
-    what the LLM analysis chain produced.
-    """
     all_gaps = partial | missing
 
-    # ── Key_Matches ───────────────────────────────────────────────────────
-    # Keep only LLM entries grounded in actual matched skills
     merged["Key_Matches"] = [
         item for item in merged.get("Key_Matches", [])
         if any(
-            normalize_skill(s) in item.lower() or _exact_overlap(s, item)
+            _basic_normalize(s) in item.lower() or _exact_overlap(s, item)
             for s in matched
         )
     ]
-    # Ensure every matched skill is represented
     represented_m = {
         s for s in matched
         if any(
-            normalize_skill(s) in item.lower() or _exact_overlap(s, item)
+            _basic_normalize(s) in item.lower() or _exact_overlap(s, item)
             for item in merged["Key_Matches"]
         )
     }
     for skill in sorted(matched - represented_m):
         merged["Key_Matches"].append(f"{skill} — demonstrated in resume")
 
-    # ── Key_Gaps ──────────────────────────────────────────────────────────
-    # Keep only LLM entries grounded in actual gaps
     merged["Key_Gaps"] = [
         item for item in merged.get("Key_Gaps", [])
         if any(
-            normalize_skill(s) in item.lower() or _exact_overlap(s, item)
+            _basic_normalize(s) in item.lower() or _exact_overlap(s, item)
             for s in all_gaps
         )
     ]
-    # Deduplicate
     merged["Key_Gaps"] = _dedupe_gaps(merged["Key_Gaps"], all_gaps)
 
-    # Add any gap the LLM missed
     represented_g = {
         s for s in all_gaps
         if any(
-            normalize_skill(s) in item.lower() or _exact_overlap(s, item)
+            _basic_normalize(s) in item.lower() or _exact_overlap(s, item)
             for item in merged["Key_Gaps"]
         )
     }
@@ -2675,10 +1101,8 @@ def _apply_hard_validation(
     for skill in sorted((missing - represented_g) - partial):
         merged["Key_Gaps"].append(f"No experience with {skill}")
 
-    # Final dedup
     merged["Key_Gaps"] = _dedupe_gaps(merged["Key_Gaps"], all_gaps)
 
-    # ── Score explanation cleanup ─────────────────────────────────────────
     if "Score_Explanation_Technical" in merged:
         explanation = merged["Score_Explanation_Technical"]
         for skill in matched:
@@ -2688,7 +1112,7 @@ def _apply_hard_validation(
                 explanation,
             )
         for skill in all_gaps:
-            if not _word_boundary_re(normalize_skill(skill)).search(explanation.lower()):
+            if not _word_boundary_re(_basic_normalize(skill)).search(explanation.lower()):
                 if skill in partial:
                     explanation += f" {skill.title()} is present but only at a basic level."
                 else:
@@ -2735,7 +1159,7 @@ async def process(suggester=Depends(get_question_suggester)):
 
     # ── Cache check ───────────────────────────────────────────────────────
     cache_key = _content_hash(resume_text, jd_text)
-    cached = memory_store.get("analysis_cache", {}).get(cache_key)
+    cached    = memory_store.get("analysis_cache", {}).get(cache_key)
     if cached:
         print("[CACHE HIT] returning cached result")
         return cached
@@ -2744,17 +1168,43 @@ async def process(suggester=Depends(get_question_suggester)):
     llm      = _make_llm()
     embedder = _make_embedder()
 
-    # ── Step 1: Skill extraction ──────────────────────────────────────────
-    resume_skills, jd_skills = await _extract_skills_llm(resume_text, jd_text, llm)
-    print("RESUME SKILLS:", sorted(resume_skills))
-    print("JD SKILLS    :", sorted(jd_skills))
+    # =========================================================================
+    # Step 1 + 2: Combined extraction + normalisation (single LLM call)
+    # Run in parallel with OR-group detection (pure regex, no LLM needed).
+    # =========================================================================
+    (
+        (resume_skills_raw, jd_skills_raw, resume_mapping, jd_mapping),
+        or_groups,
+    ) = await asyncio.gather(
+        _with_timeout(
+            _extract_and_normalise_combined(resume_text, jd_text, llm),
+            timeout_seconds=35,
+            fallback=(
+                list(extract_skills(resume_text)),
+                list(extract_skills(jd_text)),
+                {},
+                {},
+            ),
+            label="combined extraction + normalisation",
+        ),
+        asyncio.to_thread(_extract_or_groups, jd_text),
+    )
 
-    # ── Step 2: OR-group detection ────────────────────────────────────────
-    or_groups = _extract_or_groups(jd_text)
+    print("RESUME SKILLS (raw):", sorted(resume_skills_raw))
+    print("JD SKILLS     (raw):", sorted(jd_skills_raw))
 
-    # ── Step 3: Three-layer skill classification ──────────────────────────
+    # =========================================================================
+    # Step 3: Three-phase skill classification
+    # =========================================================================
     matched, partial, missing = await classify_skills(
-        resume_skills, jd_skills, resume_text, embedder
+        resume_skills_raw,
+        jd_skills_raw,
+        resume_text,
+        jd_text,
+        embedder,
+        llm,
+        resume_mapping,
+        jd_mapping,
     )
 
     # ── Step 4: OR-group resolution ───────────────────────────────────────
@@ -2764,23 +1214,29 @@ async def process(suggester=Depends(get_question_suggester)):
     print("PARTIAL :", sorted(partial))
     print("MISSING :", sorted(missing))
 
-    # ── Step 5: Scoring ───────────────────────────────────────────────────
-    # Partial skills penalised at 0.6 weight (raised from 0.4 — partial is close
-    # to matched; over-penalising was a major source of score deflation).
-    total         = len(jd_skills) if jd_skills else 1
-    skill_score   = round((len(matched) + 0.6 * len(partial)) / total * 100, 1)
+    # =========================================================================
+    # Step 5: Skill score only
+    # =========================================================================
+    resume_skills_canonical = sorted(_apply_mapping(resume_skills_raw, resume_mapping))
+    jd_skills_canonical     = sorted({
+        jd_mapping.get(s.lower(), _basic_normalize(s)) for s in jd_skills_raw
+    })
 
-    resume_exp    = _resolve_resume_experience(resume_text)
-    jd_exp        = extract_experience(jd_text)
-    exp_score     = compute_experience_score(resume_exp, jd_exp)
-    final_score   = compute_final_score(skill_score, exp_score)
+    total       = len(jd_skills_canonical) if jd_skills_canonical else 1
+    skill_score = round((len(matched) + 0.4 * len(partial)) / total * 100, 1)
 
-    # ── Step 6: Analysis + shrink (parallel) ─────────────────────────────
+    resume_exp = _resolve_resume_experience(resume_text)
+    jd_exp     = extract_experience(jd_text)
+
+    # =========================================================================
+    # Step 6: Analysis + shrink + experience score + question generation
+    #         ALL four tasks run in parallel via asyncio.gather
+    # =========================================================================
     resp_task = _build_analysis_chain(llm).ainvoke({
         "jd_text":        jd_text,
         "resume_text":    resume_text,
-        "resume_skills":  sorted(resume_skills),
-        "jd_skills":      sorted(jd_skills),
+        "resume_skills":  resume_skills_canonical,
+        "jd_skills":      jd_skills_canonical,
         "matched_skills": sorted(matched),
         "partial_skills": sorted(partial),
         "missing_skills": sorted(missing),
@@ -2788,38 +1244,48 @@ async def process(suggester=Depends(get_question_suggester)):
     shrink_task = _build_shrink_chain(llm).ainvoke({
         "combined_text": f"{jd_text}\n{resume_text}"
     })
-    resp, shrinked_output = await asyncio.gather(resp_task, shrink_task)
-    print("Shrink sentences:", shrinked_output.sentences)
-
-    # ── Step 7: Question suggestion + reframing ───────────────────────────
-    suggested_questions = list(set(
-        q
-        for query in shrinked_output.sentences
-        for q in suggester.suggest_questions(query, top_k=20)
-    ))
-    reframed_raw = await _build_question_reframe_chain(llm).ainvoke({
-        "suggested_questions": suggested_questions
-    })
-    questions = (
-        normalize_suggested_questions(reframed_raw.content)
-        or suggested_questions[:10]
+    exp_task = compute_experience_score_v2(resume_text, jd_text, llm=llm)
+    question_task = _with_timeout(
+        _generate_interview_questions(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            matched_skills=matched,
+            partial_skills=partial,
+            missing_skills=missing,
+            llm=llm,
+        ),
+        timeout_seconds=25,
+        fallback=[],
+        label="interview question generation",
     )
 
-    # ── Step 8: Build response ────────────────────────────────────────────
+    resp, shrinked_output, (exp_score, exp_breakdown), questions = await asyncio.gather(
+        resp_task, shrink_task, exp_task, question_task
+    )
+
+    print("Shrink sentences:", shrinked_output.sentences)
+    print(f"[EXP] score={exp_score}  breakdown={exp_breakdown}")
+    print(f"[QUESTIONS] {len(questions)} generated")
+
+    # final_score is 0–10 (compute_final_score divides by 10 internally)
+    final_score = compute_final_score(skill_score, exp_score)
+
+    # ── Step 7: Build response ────────────────────────────────────────────
     response = resp.model_dump()
     merged   = {**response["Evaluation"], **response["Grammar_Check"]}
 
-    merged["JD_MatchScore"]           = format_score(final_score)
+    merged["JD_MatchScore"]           = f"{final_score}/10"
     merged["Skill_Score"]             = skill_score
-    merged["Skill_Coverage"]          = f"{len(matched)}/{len(jd_skills)}"
+    merged["Skill_Coverage"]          = f"{len(matched)}/{len(jd_skills_canonical)}"
     merged["Experience_Score"]        = exp_score
+    merged["Experience_Breakdown"]    = exp_breakdown
     merged["Resume_Experience"]       = resume_exp
     merged["JD_Required_Experience"]  = jd_exp
     merged["Matched_Skills"]          = sorted(matched)
     merged["Partial_Skills"]          = sorted(partial)
     merged["Missing_Skills"]          = sorted(missing)
-    merged["Extracted_Resume_Skills"] = sorted(resume_skills)
-    merged["Extracted_JD_Skills"]     = sorted(jd_skills)
+    merged["Extracted_Resume_Skills"] = resume_skills_canonical
+    merged["Extracted_JD_Skills"]     = jd_skills_canonical
 
     # Hard validation — final correctness guarantee
     merged = _apply_hard_validation(merged, matched, partial, missing)
@@ -2827,22 +1293,31 @@ async def process(suggester=Depends(get_question_suggester)):
     merged["Grammatical_Errors"] = filter_grammar_errors(
         merged.get("Grammatical_Errors", []), resume_text
     )
-    merged["Spelling_Mistakes"]  = filter_spelling_errors(
+    merged["Spelling_Mistakes"] = filter_spelling_errors(
         merged.get("Spelling_Mistakes", []), resume_text
     )
     merged["Client_Names"]        = await _extract_client_names_llm(resume_text, llm)
     merged["Suggested_Questions"] = questions
 
-    # ── Step 9: Course suggestions ────────────────────────────────────────
-    all_gap_skills = sorted(partial | missing)
-    key_gaps_str   = " ".join(merged.get("Key_Gaps") or [])
-    suggest_course = suggester.suggest_courses(
-        key_gaps_str, top_k=20, filter_value='resource'
-    )
+    # ── Step 8: Course suggestions (per-skill targeted retrieval) ─────────
+    seen_courses:  set[str] = set()
+    suggest_course: list    = []
+
+    for skill in sorted(partial | missing)[:8]:   # cap at 8 skills
+        results = suggester.suggest_courses(skill, top_k=3, filter_value='resource')
+        for course in results:
+            key = (course.get("course") or "")[:60]
+            if key and key not in seen_courses:
+                seen_courses.add(key)
+                suggest_course.append(course)
+
     if not suggest_course:
         suggest_course = suggester.suggest_courses(
-            " ".join(all_gap_skills), top_k=5, filter_value='resource'
+            " ".join(sorted(partial | missing)[:5]),
+            top_k=5,
+            filter_value='resource',
         )
+
     merged["Suggest_course"]  = suggest_course
     merged["Resume_Filename"] = (
         resume_info.get("filename", "analysis-result").rsplit('.', 1)[0]
@@ -2866,9 +1341,9 @@ async def analyzejd():
     jd_info  = jd_store['analyze_jd']
     jd_text  = extract_text(jd_info["bytes"], jd_info["filename"])
 
-    llm            = ChatGroq(model="openai/gpt-oss-20b")
+    llm             = ChatGroq(model="openai/gpt-oss-20b")
     pydantic_parser = PydanticOutputParser(pydantic_object=JDAnalysisResponse)
-    fixing_parser  = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
+    fixing_parser   = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
 
     prompt = PromptTemplate(
         input_variables=["jd_text", "format_instructions"],
@@ -2877,8 +1352,8 @@ You are an HR Analyst AI assistant. Given the Job Description below:
 
 1. Sanitize: remove sensitive info (names, emails, phone numbers).
 2. Extract:
-   - Must-have skills (3-5)
-   - Good-to-have skills (2-3)
+   - Must-have skills (all)
+   - Good-to-have skills (all)
    - Location
    - Duration
    - Experience: all requirements, semicolon-separated. "Not specified" if absent.
